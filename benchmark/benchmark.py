@@ -613,22 +613,51 @@ def enrich_text_with_wordnet_wsd(text: str) -> str:
     return raw
 
 
-def compute_span_calibrated_sentiment(span_text: str, default_sent_id: int) -> int:
+CONTRAST_CONJUNCTION_START_RE = re.compile(
+    r"^(?:even\s+though|but|however|though|although|yet|while|whereas|except|unfortunately)\b",
+    flags=re.IGNORECASE,
+)
+CLAUSE_INTERNAL_SPLIT_RE = re.compile(
+    r"(?:[,;]\s*(?P<conj_p>even\s+though|but|however|though|although|yet|while|whereas|except|unfortunately)\b)"
+    r"|(?:\s+(?P<conj_w>even\s+though|but|however|though|although|yet|while|whereas)\b)"
+    r"|(?P<semi>;)",
+    flags=re.IGNORECASE,
+)
+LOYALTY_PHRASE_RE = re.compile(
+    r"\b(many times|return visit|came back|come back|been here|stay again|recommend|book early|must go)\b"
+)
+
+
+def _analyze_span_lexical_counts(span_text: str) -> Tuple[int, int, int]:
+    """Count positive, negative, and hedging lexical cues with negation handling."""
     raw_toks, _ = nltk_negation_aware_preprocess(span_text)
     pos_cnt = sum(1 for t in raw_toks if t in OPINION_LEXICON_POS)
     neg_cnt = sum(1 for t in raw_toks if t in OPINION_LEXICON_NEG)
     hedge_cnt = sum(1 for t in raw_toks if t in HEDGING_MODIFIERS and t not in {"never"})
 
+    negators = {"not", "never", "no", "hardly", "barely"}
+    skip_advs = {"very", "too", "so", "that", "really", "at"}
     for idx_t, tok in enumerate(raw_toks[:-1]):
-        if tok in {"not", "never", "no", "hardly"} and raw_toks[idx_t + 1] != "forget":
+        if tok in negators and raw_toks[idx_t + 1] != "forget":
             nxt = raw_toks[idx_t + 1]
-            if nxt in OPINION_LEXICON_POS:
+            target = nxt
+            if nxt in skip_advs and idx_t + 2 < len(raw_toks):
+                target = raw_toks[idx_t + 2]
+                if nxt == "at" and target == "all" and idx_t + 3 < len(raw_toks):
+                    target = raw_toks[idx_t + 3]
+            if target in OPINION_LEXICON_POS:
                 pos_cnt = max(0, pos_cnt - 1)
                 neg_cnt += 1
-            elif nxt in OPINION_LEXICON_NEG:
+            elif target in OPINION_LEXICON_NEG:
                 neg_cnt = max(0, neg_cnt - 1)
                 pos_cnt += 1
 
+    return pos_cnt, neg_cnt, hedge_cnt
+
+
+def compute_span_calibrated_sentiment(span_text: str, default_sent_id: int) -> int:
+    """Calibrate span polarity (1=Neg, 2=Neu, 3=Pos) using lexicon and negation cues."""
+    pos_cnt, neg_cnt, hedge_cnt = _analyze_span_lexical_counts(span_text)
     base_sent = default_sent_id if default_sent_id in (1, 2, 3) else 2
 
     if neg_cnt > pos_cnt and neg_cnt >= 1:
@@ -643,6 +672,254 @@ def compute_span_calibrated_sentiment(span_text: str, default_sent_id: int) -> i
         return 2
     else:
         return base_sent
+
+
+def _trim_clause_span(raw_text: str, start: int, end: int, strip_trailing_sep: bool = False) -> Tuple[int, int]:
+    while start < end and raw_text[start].isspace():
+        start += 1
+    while end > start and (raw_text[end - 1].isspace() or (strip_trailing_sep and raw_text[end - 1] in ",;")):
+        end -= 1
+    return start, end
+
+
+def split_into_opinion_clauses(raw_text: str) -> List[Tuple[int, int, str]]:
+    """Split review into opinion clauses at sentence boundaries, semicolons, and contrast conjunctions."""
+    text = str(raw_text or "")
+    if not text.strip():
+        return []
+
+    final_clauses: List[Tuple[int, int, str]] = []
+    for sent_m in re.finditer(r"[^.!?]+[.!?]*", text):
+        s_start, s_end = _trim_clause_span(text, sent_m.start(), sent_m.end(), strip_trailing_sep=False)
+        if s_start >= s_end:
+            continue
+
+        sent_slice = text[s_start:s_end]
+        split_points: List[int] = [0]
+        for m in CLAUSE_INTERNAL_SPLIT_RE.finditer(sent_slice):
+            if m.group("conj_p") is not None:
+                pos = m.start("conj_p")
+            elif m.group("conj_w") is not None:
+                pos = m.start("conj_w")
+                conj_low = m.group("conj_w").lower()
+                prefix_words = re.findall(r"[a-z]+", sent_slice[:pos].lower())
+                if conj_low == "though" and prefix_words and prefix_words[-1] == "even":
+                    continue
+                if conj_low == "while" and prefix_words and prefix_words[-1] == "a":
+                    continue
+                if conj_low == "yet" and prefix_words and prefix_words[-1] in {"not", "as"}:
+                    continue
+            else:
+                pos = m.end("semi")
+
+            if pos > split_points[-1] and sent_slice[split_points[-1]:pos].strip():
+                split_points.append(pos)
+
+        split_points.append(len(sent_slice))
+
+        raw_parts: List[Tuple[int, int]] = []
+        for a, b in zip(split_points[:-1], split_points[1:]):
+            ps, pe = _trim_clause_span(text, s_start + a, s_start + b, strip_trailing_sep=True)
+            if ps < pe:
+                raw_parts.append((ps, pe))
+
+        if not raw_parts:
+            continue
+
+        merged_parts: List[Tuple[int, int]] = []
+        idx = 0
+        while idx < len(raw_parts):
+            ps, pe = raw_parts[idx]
+            word_cnt = len(re.findall(r"[a-zA-Z]+", text[ps:pe]))
+            if word_cnt < 2:
+                if merged_parts:
+                    prev_s, _ = merged_parts[-1]
+                    merged_parts[-1] = (prev_s, pe)
+                elif idx + 1 < len(raw_parts):
+                    _, next_e = raw_parts[idx + 1]
+                    raw_parts[idx + 1] = (ps, next_e)
+                else:
+                    merged_parts.append((ps, pe))
+            else:
+                merged_parts.append((ps, pe))
+            idx += 1
+
+        for ps, pe in merged_parts:
+            ps, pe = _trim_clause_span(text, ps, pe, strip_trailing_sep=False)
+            if ps < pe:
+                final_clauses.append((ps, pe, text[ps:pe]))
+
+    if not final_clauses and text.strip():
+        s, e = _trim_clause_span(text, 0, len(text), strip_trailing_sep=False)
+        if s < e:
+            final_clauses.append((s, e, text[s:e]))
+    return final_clauses
+
+
+def count_clause_aspect_keywords(clause_text: str, aspect_name: str, custom_kw_set: Optional[set] = None) -> int:
+    """Count keyword hits in a clause for the given aspect."""
+    s_raw_toks, s_clean_toks = nltk_negation_aware_preprocess(clause_text)
+    s_all_toks = set(s_raw_toks) | set(s_clean_toks)
+    kw_set = custom_kw_set if custom_kw_set is not None else ASPECT_KEYWORDS.get(aspect_name, set())
+    hits = sum(1 for w in s_all_toks if w in kw_set)
+    if aspect_name == "Loyalty" and LOYALTY_PHRASE_RE.search(clause_text.lower()):
+        hits += 2
+    return hits
+
+
+def extract_multi_polarity_segments(
+    aspect_name: str,
+    pred_cls: int,
+    clauses: List[Tuple[int, int, str]],
+    clause_model_scores: List[float],
+    clause_kw_hits: List[int],
+    clause_other_kw_hits: List[int],
+    clause_gru_ov: Optional[List[float]] = None,
+    clause_other_max_scores: Optional[List[float]] = None,
+    clause_tok_pol_probs: Optional[List[Optional[np.ndarray]]] = None,
+    model_weight: float = 0.40,
+    gru_weight: float = 0.15,
+    ebr_weight: float = 0.45,
+    raw_fallback_text: str = "",
+) -> List[Dict[str, str]]:
+    """Select all relevant clauses for an aspect (with contrast inheritance) and group by polarity."""
+    if not clauses:
+        txt = str(raw_fallback_text or "").strip()
+        if not txt:
+            return []
+        cal = compute_span_calibrated_sentiment(txt, pred_cls)
+        return [{"sentiment": ID_TO_SENTIMENT.get(cal, ID_TO_SENTIMENT.get(pred_cls, "Neutral")), "text": txt}]
+
+    n_clauses = len(clauses)
+    eff_scores: List[float] = []
+    starts_contrast_list: List[bool] = []
+    has_opinion_list: List[bool] = []
+
+    for i in range(n_clauses):
+        c_str = clauses[i][2]
+        rat_sc = float(clause_model_scores[i])
+        kw_h = int(clause_kw_hits[i])
+        other_kw = int(clause_other_kw_hits[i])
+        gru_ov = float(clause_gru_ov[i]) if clause_gru_ov is not None else 0.0
+        ebr_sc = min(1.0, kw_h * 0.45)
+        raw_total = model_weight * rat_sc + gru_weight * gru_ov + ebr_weight * ebr_sc
+        eff_sc = raw_total * 0.25 if (kw_h == 0 and other_kw > 0) else raw_total
+        eff_scores.append(eff_sc)
+
+        s_raw_toks, _ = nltk_negation_aware_preprocess(c_str)
+        starts_contrast_list.append(bool(CONTRAST_CONJUNCTION_START_RE.match(c_str.strip())))
+        has_opinion_list.append(any(t in OPINION_LEXICON_POS or t in OPINION_LEXICON_NEG for t in s_raw_toks))
+
+    best_idx = max(
+        range(n_clauses),
+        key=lambda idx: (clause_kw_hits[idx] > 0, clause_other_kw_hits[idx] == 0, eff_scores[idx]),
+    )
+    best_rat = float(clause_model_scores[best_idx])
+
+    selected = [False] * n_clauses
+    selected[best_idx] = True
+
+    for i in range(n_clauses):
+        if clause_kw_hits[i] > 0:
+            selected[i] = True
+            continue
+        if clause_other_kw_hits[i] == 0:
+            rat_sc = float(clause_model_scores[i])
+            gru_ov = float(clause_gru_ov[i]) if clause_gru_ov is not None else 0.0
+            other_max = float(clause_other_max_scores[i]) if clause_other_max_scores is not None else 0.0
+            high_model_rel = (
+                rat_sc >= max(0.42, best_rat * 0.72)
+                and (has_opinion_list[i] or gru_ov > 0.10 or rat_sc >= 0.55)
+                and (other_max <= 0.0 or rat_sc >= other_max * 0.90)
+            )
+            if high_model_rel:
+                selected[i] = True
+
+    # Contextual aspect inheritance across contrast conjunctions when no other aspect keywords hit
+    for i in range(1, n_clauses):
+        if (
+            not selected[i]
+            and selected[i - 1]
+            and (clause_kw_hits[i - 1] > 0 or clause_other_kw_hits[i - 1] == 0)
+            and starts_contrast_list[i]
+            and has_opinion_list[i]
+            and clause_other_kw_hits[i] == 0
+        ):
+            selected[i] = True
+
+    grouped: Dict[str, List[str]] = {}
+    for i in range(n_clauses):
+        if not selected[i]:
+            continue
+        c_str = clauses[i][2]
+        pos_cnt, neg_cnt, hedge_cnt = _analyze_span_lexical_counts(c_str)
+        lex_sent = compute_span_calibrated_sentiment(c_str, pred_cls)
+        has_lex_clue = (pos_cnt > 0 or neg_cnt > 0 or hedge_cnt > 0)
+
+        final_sent = lex_sent
+        if clause_tok_pol_probs is not None and clause_tok_pol_probs[i] is not None:
+            tok_probs = np.asarray(clause_tok_pol_probs[i], dtype=np.float32)
+            if tok_probs.shape == (3,):
+                lex_vec = np.zeros(3, dtype=np.float32)
+                lex_vec[max(0, min(2, lex_sent - 1))] = 1.0
+                if has_lex_clue and not (pos_cnt == neg_cnt and pos_cnt > 0):
+                    blended = 0.60 * lex_vec + 0.40 * tok_probs
+                else:
+                    blended = 0.30 * lex_vec + 0.70 * tok_probs
+                final_sent = int(np.argmax(blended)) + 1
+
+        sent_label = ID_TO_SENTIMENT.get(final_sent, ID_TO_SENTIMENT.get(pred_cls, "Neutral"))
+        grouped.setdefault(sent_label, []).append(c_str)
+
+    return [
+        {"sentiment": s_lbl, "text": " ".join(texts).strip()}
+        for s_lbl, texts in grouped.items()
+        if texts
+    ]
+
+
+def format_aspect_segments_output(segments: Optional[List[Dict[str, str]]], aspect_name: Optional[str] = None) -> str:
+    """Format aspect segments with polarity-grouped sub-bullets when >=2 polarity groups exist."""
+    segs = segments or []
+    if aspect_name is None:
+        if not segs:
+            return ""
+        if len(segs) == 1:
+            return f"{segs[0]['sentiment']} - {segs[0]['text']}"
+        return "\n" + "\n".join(f"  + {s['sentiment']} - {s['text']}" for s in segs)
+
+    if not segs:
+        return f"- {aspect_name}:"
+    if len(segs) == 1:
+        return f"- {aspect_name}: {segs[0]['sentiment']} - {segs[0]['text']}"
+    sub_lines = [f"- {aspect_name}:"]
+    for seg in segs:
+        sub_lines.append(f"  + {seg['sentiment']} - {seg['text']}")
+    return "\n".join(sub_lines)
+
+
+def compute_bm25_score(
+    query_terms: set,
+    sent_tokens: List[str],
+    doc_freq_sent: Dict[str, int],
+    n_sents: int,
+    avg_sent_len: float,
+) -> float:
+    """Compute Okapi BM25 relevance score for a clause against an aspect term set."""
+    if not sent_tokens or not query_terms:
+        return 0.0
+    s_len = len(sent_tokens)
+    tf_map = Counter(sent_tokens)
+    score = 0.0
+    for q in query_terms:
+        if q in tf_map:
+            f_qs = tf_map[q]
+            df_q = doc_freq_sent.get(q, 0)
+            idf_q = math.log((n_sents - df_q + 0.5) / (df_q + 0.5) + 1.0)
+            num = f_qs * (1.5 + 1.0)
+            den = f_qs + 1.5 * (1.0 - 0.75 + 0.75 * (s_len / max(avg_sent_len, 1.0)))
+            score += idf_q * (num / max(den, 1e-6))
+    return score
 
 
 def extract_20_features_for_new_review(review_text: str) -> np.ndarray:
@@ -751,6 +1028,113 @@ if TORCH_AVAILABLE:
         cum_probs = torch.cumprod(probs, dim=-1)
         return (cum_probs >= 0.5).sum(dim=-1)
 
+    def _extract_transformer_aspect_segments(
+        aspect_idx: int,
+        pred_cls: int,
+        raw_text: str,
+        outputs: Dict[str, torch.Tensor],
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        tokenizer,
+        gru_tok_set: Optional[set] = None,
+        has_trained_token_polarity: bool = False,
+        model_weight: float = 0.40,
+        gru_weight: float = 0.15,
+        ebr_weight: float = 0.45,
+    ) -> List[Dict[str, str]]:
+        """Shared multi-polarity segment extraction for transformer models."""
+        aspect_name = CANONICAL_ASPECTS[aspect_idx]
+        valid_len = int(attention_mask[0].sum().item())
+        rat_probs_all = outputs["rationale_probs"][0, :, :valid_len].detach().cpu().numpy()
+        tok_ids = input_ids[0, :valid_len].detach().cpu().tolist()
+
+        norm_text = unicodedata.normalize("NFC", str(raw_text or "").strip())
+        if not norm_text:
+            norm_text = tokenizer.decode(tok_ids[1:max(1, valid_len - 1)], skip_special_tokens=True).strip()
+
+        clauses = split_into_opinion_clauses(norm_text)
+        if not clauses:
+            return extract_multi_polarity_segments(
+                aspect_name=aspect_name,
+                pred_cls=pred_cls,
+                clauses=[],
+                clause_model_scores=[],
+                clause_kw_hits=[],
+                clause_other_kw_hits=[],
+                raw_fallback_text=norm_text,
+            )
+
+        enc_off = tokenizer(
+            norm_text,
+            max_length=input_ids.size(1),
+            truncation=True,
+            return_offsets_mapping=True,
+        )
+        offsets = enc_off["offset_mapping"]
+
+        tok_pol_probs_all = None
+        if has_trained_token_polarity and "token_polarity_logits" in outputs:
+            tok_pol_probs_all = F.softmax(
+                outputs["token_polarity_logits"][0, :valid_len].detach().cpu(), dim=-1
+            ).numpy()
+
+        clause_model_scores: List[float] = []
+        clause_other_max_scores: List[float] = []
+        clause_gru_ov: Optional[List[float]] = [] if gru_tok_set is not None else None
+        clause_kw_hits: List[int] = []
+        clause_other_kw_hits: List[int] = []
+        clause_tok_pol_probs: Optional[List[Optional[np.ndarray]]] = [] if tok_pol_probs_all is not None else None
+
+        max_rat_tok = rat_probs_all.shape[1]
+        for c_start, c_end, c_str in clauses:
+            tok_indices = [
+                t_i for t_i, (ts, te) in enumerate(offsets)
+                if te > ts and ts < c_end and te > c_start and t_i < valid_len and t_i < max_rat_tok
+            ]
+            rat_sc = float(np.mean([rat_probs_all[aspect_idx, t_i] for t_i in tok_indices])) if tok_indices else 0.0
+            other_max = max(
+                (float(np.mean([rat_probs_all[o_idx, t_i] for t_i in tok_indices])) if tok_indices else 0.0)
+                for o_idx in range(len(CANONICAL_ASPECTS))
+                if o_idx != aspect_idx
+            )
+            clause_model_scores.append(rat_sc)
+            clause_other_max_scores.append(other_max)
+
+            if clause_gru_ov is not None:
+                ov = sum(1 for t_i in tok_indices if tok_ids[t_i] in gru_tok_set) / max(len(tok_indices), 1)
+                clause_gru_ov.append(ov)
+
+            if clause_tok_pol_probs is not None:
+                if tok_indices:
+                    clause_tok_pol_probs.append(tok_pol_probs_all[tok_indices].mean(axis=0))
+                else:
+                    clause_tok_pol_probs.append(None)
+
+            kw_h = count_clause_aspect_keywords(c_str, aspect_name)
+            other_kw = sum(
+                count_clause_aspect_keywords(c_str, o_asp)
+                for o_asp in CANONICAL_ASPECTS
+                if o_asp != aspect_name
+            )
+            clause_kw_hits.append(kw_h)
+            clause_other_kw_hits.append(other_kw)
+
+        return extract_multi_polarity_segments(
+            aspect_name=aspect_name,
+            pred_cls=pred_cls,
+            clauses=clauses,
+            clause_model_scores=clause_model_scores,
+            clause_kw_hits=clause_kw_hits,
+            clause_other_kw_hits=clause_other_kw_hits,
+            clause_gru_ov=clause_gru_ov,
+            clause_other_max_scores=clause_other_max_scores,
+            clause_tok_pol_probs=clause_tok_pol_probs,
+            model_weight=model_weight,
+            gru_weight=gru_weight,
+            ebr_weight=ebr_weight,
+            raw_fallback_text=norm_text,
+        )
+
     class CRAM_ABSA_MultiAspectModel(nn.Module):
         def __init__(self, backbone_name="bert-base-uncased", hidden_dim=768, num_features=20, proj_dim=256, attn_heads=8, num_aspects=6, num_sent_classes=4, corn_out_dim=2, max_comment_len=48, use_cross_attn=True):
             super().__init__()
@@ -761,6 +1145,8 @@ if TORCH_AVAILABLE:
             self.max_comment_len = max_comment_len
             self.use_cross_attn = use_cross_attn
             self.canonical_aspects = list(CANONICAL_ASPECTS)
+            self.has_trained_token_polarity = False
+            self.has_trained_multi_pol = False
 
             self.bert = AutoModel.from_pretrained(backbone_name)
             self.vocab_size = self.bert.config.vocab_size
@@ -790,6 +1176,8 @@ if TORCH_AVAILABLE:
                 )
                 for _ in range(num_aspects)
             ])
+            self.aspect_multi_pol_head = nn.Linear(hidden_dim * 2, 3)
+            self.token_polarity_proj = nn.Linear(hidden_dim, 3)
 
             self.corn_head = nn.Sequential(
                 nn.Linear(hidden_dim * 2, proj_dim),
@@ -843,11 +1231,16 @@ if TORCH_AVAILABLE:
             masked_pooled = 0.55 * rat_pooled + 0.45 * cross_ctx if cross_ctx is not None else rat_pooled
 
             aspect_logits_list = []
+            multi_pol_logits_list = []
             for a_idx in range(self.num_aspects):
                 asp_ctx = torch.cat([masked_pooled[:, a_idx, :], feat_emb], dim=-1)
                 aspect_logits_list.append(self.aspect_classifiers[a_idx](asp_ctx))
+                multi_pol_logits_list.append(self.aspect_multi_pol_head(asp_ctx))
 
             aspect_logits = torch.stack(aspect_logits_list, dim=1)
+            aspect_multi_pol_logits = torch.stack(multi_pol_logits_list, dim=1)
+            token_polarity_logits = self.token_polarity_proj(conditioned_seq)
+
             asp_present_logit = (aspect_logits[:, :, 1:].logsumexp(dim=-1, keepdim=True) - aspect_logits[:, :, 0:1]).detach()
             rationale_logits = raw_rat_logits + 0.35 * asp_present_logit.clamp(min=-6.0, max=4.0)
             rationale_probs = torch.sigmoid(rationale_logits) * pad_mask
@@ -858,6 +1251,8 @@ if TORCH_AVAILABLE:
 
             return {
                 "aspect_logits": aspect_logits,
+                "aspect_multi_pol_logits": aspect_multi_pol_logits,
+                "token_polarity_logits": token_polarity_logits,
                 "rationale_logits": rationale_logits,
                 "rationale_probs": rationale_probs,
                 "corn_logits": corn_logits,
@@ -866,12 +1261,9 @@ if TORCH_AVAILABLE:
             }
 
         @torch.no_grad()
-        def generate_aspect_commentary(self, aspect_idx: int, outputs: Dict[str, torch.Tensor], input_ids: torch.Tensor, attention_mask: torch.Tensor, tokenizer, raw_review_text: Optional[str] = None) -> str:
-            aspect_name = self.canonical_aspects[aspect_idx]
-            rat_prob = outputs["rationale_probs"][0, aspect_idx]
+        def _decode_gru_token_set(self, aspect_idx: int, outputs: Dict[str, torch.Tensor], input_ids: torch.Tensor, attention_mask: torch.Tensor, tokenizer) -> set:
             valid_len = int(attention_mask[0].sum().item())
             tok_ids = input_ids[0, :valid_len]
-            scores = rat_prob[:valid_len].detach().cpu().numpy()
 
             h_state = outputs["aspect_embeddings"][:, aspect_idx, :].unsqueeze(0).contiguous()
             cur_tok = torch.tensor([[tokenizer.cls_token_id]], dtype=torch.long, device=input_ids.device)
@@ -894,56 +1286,56 @@ if TORCH_AVAILABLE:
                 gen_ids.append(next_id)
                 cur_tok = torch.tensor([[next_id]], dtype=torch.long, device=input_ids.device)
 
-            gru_tok_set = set(gen_ids)
-            if raw_review_text is None or not str(raw_review_text).strip():
-                raw_review_text = tokenizer.decode(tok_ids[1:max(1, valid_len - 1)], skip_special_tokens=True).strip()
+            return set(gen_ids)
 
-            raw_text = unicodedata.normalize("NFC", str(raw_review_text).strip())
-            enc_off = tokenizer(
-                raw_text,
-                max_length=input_ids.size(1),
-                truncation=True,
-                return_offsets_mapping=True
+        @torch.no_grad()
+        def extract_aspect_segments(
+            self,
+            aspect_idx: int,
+            pred_cls: int,
+            outputs: Dict[str, torch.Tensor],
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor,
+            tokenizer,
+            raw_review_text: Optional[str] = None,
+        ) -> List[Dict[str, str]]:
+            gru_tok_set = self._decode_gru_token_set(aspect_idx, outputs, input_ids, attention_mask, tokenizer)
+            raw_txt = raw_review_text
+            if raw_txt is None or not str(raw_txt).strip():
+                valid_len = int(attention_mask[0].sum().item())
+                tok_ids = input_ids[0, :valid_len]
+                raw_txt = tokenizer.decode(tok_ids[1:max(1, valid_len - 1)], skip_special_tokens=True).strip()
+
+            return _extract_transformer_aspect_segments(
+                aspect_idx=aspect_idx,
+                pred_cls=pred_cls,
+                raw_text=str(raw_txt),
+                outputs=outputs,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                tokenizer=tokenizer,
+                gru_tok_set=gru_tok_set,
+                has_trained_token_polarity=bool(getattr(self, "has_trained_token_polarity", False)),
+                model_weight=0.40,
+                gru_weight=0.15,
+                ebr_weight=0.45,
             )
-            offsets = enc_off["offset_mapping"]
 
-            sent_spans = []
-            for m in re.finditer(r"[^.!?]+[.!?]*", raw_text):
-                s_str = m.group(0).strip()
-                if len(s_str) >= 3:
-                    sent_spans.append((m.start(), m.end(), s_str))
-            if not sent_spans:
-                return raw_text
-
-            asp_kw_set = ASPECT_KEYWORDS.get(aspect_name, set())
-            scored_units = []
-            for s_idx, (s_char, e_char, s_str) in enumerate(sent_spans):
-                tok_indices = [
-                    t_i for t_i, (ts, te) in enumerate(offsets)
-                    if te > ts and ts < e_char and te > s_char and t_i < valid_len
-                ]
-                rat_sc = float(np.mean([scores[t_i] for t_i in tok_indices])) if tok_indices else 0.0
-                gru_ov = sum(1 for t_i in tok_indices if int(tok_ids[t_i].item()) in gru_tok_set) / max(len(tok_indices), 1)
-                s_raw_toks, s_clean_toks = nltk_negation_aware_preprocess(s_str)
-                s_all_toks = set(s_raw_toks) | set(s_clean_toks)
-                kw_hits = sum(1 for w in s_all_toks if w in asp_kw_set)
-                if aspect_name == "Loyalty" and re.search(r"\b(many times|return visit|came back|come back|been here|stay again|recommend|book early|must go)\b", s_str.lower()):
-                    kw_hits += 2
-                ebr_sc = min(1.0, kw_hits * 0.45)
-                total_sc = 0.40 * rat_sc + 0.15 * gru_ov + 0.45 * ebr_sc
-                scored_units.append((total_sc, kw_hits, s_idx, s_str))
-
-            scored_units.sort(key=lambda x: (x[1] > 0, x[0]), reverse=True)
-            best_sc, best_kw, best_idx, best_sent = scored_units[0]
-            selected = [(best_idx, best_sent)]
-
-            for sc, kw_h, s_i, s_str in scored_units[1:]:
-                if kw_h > 0 and sc >= best_sc * 0.65 and abs(s_i - best_idx) == 1 and len(selected) < 2:
-                    selected.append((s_i, s_str))
-
-            selected.sort(key=lambda x: x[0])
-            extracted_evidence = " ".join(s for _, s in selected).strip()
-            return extracted_evidence if extracted_evidence else best_sent
+        @torch.no_grad()
+        def generate_aspect_commentary(self, aspect_idx: int, outputs: Dict[str, torch.Tensor], input_ids: torch.Tensor, attention_mask: torch.Tensor, tokenizer, raw_review_text: Optional[str] = None) -> str:
+            pred_cls = int(outputs["aspect_logits"][0, aspect_idx].argmax().item()) if "aspect_logits" in outputs else 2
+            if pred_cls == 0:
+                pred_cls = 2
+            segs = self.extract_aspect_segments(
+                aspect_idx=aspect_idx,
+                pred_cls=pred_cls,
+                outputs=outputs,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                tokenizer=tokenizer,
+                raw_review_text=raw_review_text,
+            )
+            return " ".join(seg["text"] for seg in segs).strip()
 
 
     class Paper1BERTModel(nn.Module):
@@ -968,21 +1360,38 @@ if TORCH_AVAILABLE:
             }
 
         @torch.no_grad()
+        def extract_aspect_segments(
+            self,
+            aspect_idx: int,
+            pred_cls: int,
+            review_text: str,
+            outputs: Dict[str, torch.Tensor],
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor,
+            bert_tok,
+        ) -> List[Dict[str, str]]:
+            return _extract_transformer_aspect_segments(
+                aspect_idx=aspect_idx,
+                pred_cls=pred_cls,
+                raw_text=review_text,
+                outputs=outputs,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                tokenizer=bert_tok,
+                gru_tok_set=None,
+                has_trained_token_polarity=False,
+                model_weight=0.55,
+                gru_weight=0.0,
+                ebr_weight=0.45,
+            )
+
+        @torch.no_grad()
         def extract_evidence_span(self, aspect_idx: int, review_text: str, outputs: Dict[str, torch.Tensor], input_ids: torch.Tensor, attention_mask: torch.Tensor, bert_tok) -> str:
-            rat_prob = outputs["rationale_probs"][0, aspect_idx]
-            valid_len = int(attention_mask[0].sum().item())
-            tok_ids = input_ids[0, :valid_len].cpu().tolist()
-            scores = rat_prob[:valid_len].cpu().numpy()
-            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", review_text.strip()) if s.strip()]
-            if len(sentences) > 1:
-                scored_sents = []
-                for s in sentences:
-                    s_ids = set(bert_tok.encode(paper1_clean_text(s), add_special_tokens=False))
-                    hit_scores = [scores[i] for i in range(1, valid_len - 1) if tok_ids[i] in s_ids]
-                    scored_sents.append((float(np.mean(hit_scores)) if hit_scores else 0.0, s))
-                scored_sents.sort(key=lambda x: x[0], reverse=True)
-                return scored_sents[0][1]
-            return review_text.strip()
+            pred_cls = int(outputs["aspect_logits"][0, aspect_idx].argmax().item()) if "aspect_logits" in outputs else 2
+            if pred_cls == 0:
+                pred_cls = 2
+            segs = self.extract_aspect_segments(aspect_idx, pred_cls, review_text, outputs, input_ids, attention_mask, bert_tok)
+            return " ".join(seg["text"] for seg in segs).strip() or review_text.strip()
 
 
     class Paper4MultiRegionCNN(nn.Module):
@@ -1067,21 +1476,38 @@ if TORCH_AVAILABLE:
             }
 
         @torch.no_grad()
+        def extract_aspect_segments(
+            self,
+            aspect_idx: int,
+            pred_cls: int,
+            review_text: str,
+            outputs: Dict[str, torch.Tensor],
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor,
+            bert_tok,
+        ) -> List[Dict[str, str]]:
+            return _extract_transformer_aspect_segments(
+                aspect_idx=aspect_idx,
+                pred_cls=pred_cls,
+                raw_text=review_text,
+                outputs=outputs,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                tokenizer=bert_tok,
+                gru_tok_set=None,
+                has_trained_token_polarity=False,
+                model_weight=0.55,
+                gru_weight=0.0,
+                ebr_weight=0.45,
+            )
+
+        @torch.no_grad()
         def extract_evidence_span(self, aspect_idx: int, review_text: str, outputs: Dict[str, torch.Tensor], input_ids: torch.Tensor, attention_mask: torch.Tensor, bert_tok) -> str:
-            rat_prob = outputs["rationale_probs"][0, aspect_idx]
-            valid_len = int(attention_mask[0].sum().item())
-            tok_ids = input_ids[0, :valid_len].cpu().tolist()
-            scores = rat_prob[:valid_len].cpu().numpy()
-            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", review_text.strip()) if s.strip()]
-            if len(sentences) > 1:
-                scored_sents = []
-                for s in sentences:
-                    s_ids = set(bert_tok.encode(s, add_special_tokens=False))
-                    hit_scores = [scores[i] for i in range(1, valid_len - 1) if tok_ids[i] in s_ids]
-                    scored_sents.append((float(np.mean(hit_scores)) if hit_scores else 0.0, s))
-                scored_sents.sort(key=lambda x: x[0], reverse=True)
-                return scored_sents[0][1]
-            return review_text.strip()
+            pred_cls = int(outputs["aspect_logits"][0, aspect_idx].argmax().item()) if "aspect_logits" in outputs else 2
+            if pred_cls == 0:
+                pred_cls = 2
+            segs = self.extract_aspect_segments(aspect_idx, pred_cls, review_text, outputs, input_ids, attention_mask, bert_tok)
+            return " ".join(seg["text"] for seg in segs).strip() or review_text.strip()
 
 
 def get_shared_bert_tokenizer():
@@ -1155,6 +1581,9 @@ def load_model_bundle(model_path: Path) -> Dict[str, Any]:
         if k in model_sd and hasattr(v, "shape") and v.shape == model_sd[k].shape
     }
     net.load_state_dict(compat_sd, strict=False)
+    if arch == "cram_absa":
+        net.has_trained_token_polarity = ("token_polarity_proj.weight" in raw_sd)
+        net.has_trained_multi_pol = ("aspect_multi_pol_head.weight" in raw_sd)
     net = net.to(DEVICE)
     net.eval()
 
@@ -1267,10 +1696,10 @@ def prepare_cram_test_tensors(df_test, tokenizer, max_len: int = 256) -> Dict[st
                     for _, o_idx, o_s, o_e in valid_anns
                 )
                 kw_toks = [t_i for t_i in span_toks if t_i in tok_aspect_kw[asp]]
-                if (overlaps_other or has_multi_asp) and kw_toks:
+                if overlaps_other and kw_toks:
                     for t_i in span_toks:
                         d = min(abs(t_i - k_i) for k_i in kw_toks)
-                        if d <= 4:
+                        if d <= 8:
                             rationale_masks[asp_idx, t_i] = 1.0
                             if d < tok_min_dist[asp_idx, t_i]:
                                 tok_min_dist[asp_idx, t_i] = d
@@ -1653,22 +2082,6 @@ def run_test_split_benchmark(
             avg_sent_len = float(ckpt.get("avg_sent_len", 12.0))
             doc_freq_sent = ckpt.get("doc_freq_sent", {})
 
-            def compute_bm25(query_terms: set, sent_tokens: List[str]) -> float:
-                if not sent_tokens or not query_terms:
-                    return 0.0
-                s_len = len(sent_tokens)
-                tf_map = Counter(sent_tokens)
-                score = 0.0
-                for q in query_terms:
-                    if q in tf_map:
-                        f_qs = tf_map[q]
-                        df_q = doc_freq_sent.get(q, 0)
-                        idf_q = math.log((N_sents - df_q + 0.5) / (df_q + 0.5) + 1.0)
-                        num = f_qs * (1.5 + 1.0)
-                        den = f_qs + 1.5 * (1.0 - 0.75 + 0.75 * (s_len / max(avg_sent_len, 1.0)))
-                        score += idf_q * (num / max(den, 1e-6))
-                return score
-
             svm_w_np = net.svm_weights.detach().cpu().numpy()
             svm_b_np = net.svm_biases.detach().cpu().numpy()
 
@@ -1725,7 +2138,7 @@ def run_test_split_benchmark(
                         for s in raw_sents:
                             s_toks = paper4_preprocess_tokens(s)
                             for asp in CANONICAL_ASPECTS:
-                                sc = compute_bm25(koha_exp[asp], s_toks)
+                                sc = compute_bm25_score(koha_exp[asp], s_toks, doc_freq_sent, N_sents, avg_sent_len)
                                 if sc > 0.0:
                                     clusters[asp].append((sc, s))
 
@@ -1936,13 +2349,20 @@ def evaluate_new_review(review_text: str, model_key: str) -> Dict[str, Any]:
 
             mentioned_aspects = []
             lines = []
-            aspect_details = {}
+            aspect_segments: Dict[str, List[Dict[str, str]]] = {}
 
             with torch.no_grad():
                 if arch == "paper4_bm25_tfigm_svm_cnn":
                     word2idx = ckpt.get("word2idx", {})
                     igm_weights = ckpt.get("igm_weights", np.zeros(net.embedding.num_embeddings, dtype=np.float32))
                     koha_exp = {k: set(v) for k, v in ckpt.get("koha_expanded", {}).items()}
+                    for asp in CANONICAL_ASPECTS:
+                        if asp not in koha_exp or not koha_exp[asp]:
+                            koha_exp[asp] = set(ASPECT_KEYWORDS.get(asp, set()))
+                    N_sents = max(int(ckpt.get("N_sents", 10000)), 1)
+                    avg_sent_len = float(ckpt.get("avg_sent_len", 12.0))
+                    doc_freq_sent = ckpt.get("doc_freq_sent", {})
+
                     toks = paper4_preprocess_tokens(raw_text)
                     ids = [word2idx[t] for t in toks if t in word2idx][:128]
                     if len(ids) < 128:
@@ -1963,27 +2383,45 @@ def evaluate_new_review(review_text: str, model_key: str) -> Dict[str, Any]:
                     svm_asp_l = torch.einsum("bd,acd->bac", v_igm, net.svm_weights) + net.svm_biases
                     blended_asp = (0.7 * svm_asp_l + 0.3 * cnn_asp_l).squeeze(0).cpu().numpy()
 
-                    raw_sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", raw_text) if s.strip()]
-                    if not raw_sents:
-                        raw_sents = [raw_text]
+                    clauses = split_into_opinion_clauses(raw_text)
+                    bm25_by_asp: Dict[str, List[float]] = {a: [] for a in CANONICAL_ASPECTS}
+                    kw_by_asp: Dict[str, List[int]] = {a: [] for a in CANONICAL_ASPECTS}
+                    for _, _, c_str in clauses:
+                        c_p4_toks = paper4_preprocess_tokens(c_str)
+                        for asp_name in CANONICAL_ASPECTS:
+                            bm25_val = compute_bm25_score(
+                                koha_exp[asp_name], c_p4_toks, doc_freq_sent, N_sents, avg_sent_len
+                            )
+                            bm25_by_asp[asp_name].append(min(1.0, bm25_val / 4.0))
+                            kw_by_asp[asp_name].append(count_clause_aspect_keywords(c_str, asp_name))
 
                     for a_idx, asp in enumerate(CANONICAL_ASPECTS):
                         pred_cls = int(np.argmax(blended_asp[a_idx]))
                         if pred_cls != 0:
                             mentioned_aspects.append(asp)
-                            q_set = koha_exp.get(asp, ASPECT_KEYWORDS.get(asp, set()))
-                            scored_s = []
-                            for s_str in raw_sents:
-                                s_u = [cached_lemmatize(t) for t in re.findall(r"[a-z]+", s_str.lower()) if t not in RAW_STOPWORDS]
-                                hits = sum(1 for w in s_u if w in q_set)
-                                scored_s.append((hits, s_str))
-                            scored_s.sort(key=lambda x: x[0], reverse=True)
-                            ev_span = scored_s[0][1] if scored_s else raw_text
-                            cal_sent = compute_span_calibrated_sentiment(ev_span, pred_cls)
-                            sent_label = ID_TO_SENTIMENT.get(cal_sent, ID_TO_SENTIMENT[pred_cls])
-                            aspect_details[asp] = f"{sent_label} - {ev_span}"
+                            other_kw_list = [
+                                sum(kw_by_asp[o_asp][i] for o_asp in CANONICAL_ASPECTS if o_asp != asp)
+                                for i in range(len(clauses))
+                            ]
+                            other_max_list = [
+                                max(bm25_by_asp[o_asp][i] for o_asp in CANONICAL_ASPECTS if o_asp != asp)
+                                for i in range(len(clauses))
+                            ] if clauses else []
+                            aspect_segments[asp] = extract_multi_polarity_segments(
+                                aspect_name=asp,
+                                pred_cls=pred_cls,
+                                clauses=clauses,
+                                clause_model_scores=bm25_by_asp[asp],
+                                clause_kw_hits=kw_by_asp[asp],
+                                clause_other_kw_hits=other_kw_list,
+                                clause_other_max_scores=other_max_list,
+                                model_weight=0.55,
+                                gru_weight=0.0,
+                                ebr_weight=0.45,
+                                raw_fallback_text=raw_text,
+                            )
                         else:
-                            aspect_details[asp] = ""
+                            aspect_segments[asp] = []
                 else:
                     enc = tok(raw_text, max_length=256, padding="max_length", truncation=True, return_tensors="pt")
                     input_ids = enc["input_ids"].to(DEVICE)
@@ -2013,31 +2451,42 @@ def evaluate_new_review(review_text: str, model_key: str) -> Dict[str, Any]:
                         outputs = net(input_ids=input_ids, attention_mask=attention_mask)
 
                     asp_probs = F.softmax(outputs["aspect_logits"].squeeze(0), dim=-1).cpu().numpy()
+                    multi_pol_probs = None
+                    if (
+                        arch == "cram_absa"
+                        and getattr(net, "has_trained_multi_pol", False)
+                        and "aspect_multi_pol_logits" in outputs
+                    ):
+                        multi_pol_probs = torch.sigmoid(outputs["aspect_multi_pol_logits"].squeeze(0)).cpu().numpy()
+
                     for a_idx, asp in enumerate(CANONICAL_ASPECTS):
                         pred_cls = int(np.argmax(asp_probs[a_idx]))
+                        if pred_cls == 0 and multi_pol_probs is not None:
+                            if float(multi_pol_probs[a_idx].max()) >= 0.65 and float(asp_probs[a_idx, 0]) < 0.65:
+                                pred_cls = int(np.argmax(asp_probs[a_idx, 1:4])) + 1
+
                         if pred_cls != 0:
                             mentioned_aspects.append(asp)
                             if arch == "cram_absa":
-                                ev_span = net.generate_aspect_commentary(a_idx, outputs, input_ids, attention_mask, tok, raw_review_text=raw_text)
+                                aspect_segments[asp] = net.extract_aspect_segments(
+                                    a_idx, pred_cls, outputs, input_ids, attention_mask, tok, raw_review_text=raw_text
+                                )
                             else:
-                                ev_span = net.extract_evidence_span(a_idx, raw_text, outputs, input_ids, attention_mask, tok)
-                            cal_sent = compute_span_calibrated_sentiment(ev_span, pred_cls)
-                            sent_label = ID_TO_SENTIMENT.get(cal_sent, ID_TO_SENTIMENT[pred_cls])
-                            aspect_details[asp] = f"{sent_label} - {ev_span}"
+                                aspect_segments[asp] = net.extract_aspect_segments(
+                                    a_idx, pred_cls, raw_text, outputs, input_ids, attention_mask, tok
+                                )
                         else:
-                            aspect_details[asp] = ""
+                            aspect_segments[asp] = []
 
             aspect_str = ", ".join(mentioned_aspects) if mentioned_aspects else "None"
             lines.append(f"- Aspect: {aspect_str}")
             for asp in CANONICAL_ASPECTS:
-                if aspect_details[asp]:
-                    lines.append(f"- {asp}: {aspect_details[asp]}")
-                else:
-                    lines.append(f"- {asp}:")
+                lines.append(format_aspect_segments_output(aspect_segments.get(asp, []), aspect_name=asp))
 
             return {
                 "ok": True,
                 "aspect_line": aspect_str,
+                "aspect_segments": aspect_segments,
                 "formatted_text": "\n".join(lines)
             }
     except Exception as e:
