@@ -675,6 +675,16 @@ def compute_span_calibrated_sentiment(span_text: str, default_sent_id: int) -> i
         return base_sent
 
 
+def _calibrate_aspect_vote(votes_list: List[int], span_texts: List[str], fallback_text: str) -> int:
+    """Compute unified majority + span-calibrated aspect ground-truth label across all models."""
+    maj_sent = Counter(votes_list).most_common(1)[0][0]
+    joined_span = " ".join(span_texts).strip()
+    return compute_span_calibrated_sentiment(
+        joined_span if joined_span else fallback_text,
+        maj_sent
+    )
+
+
 def _trim_clause_span(raw_text: str, start: int, end: int, strip_trailing_sep: bool = False) -> Tuple[int, int]:
     while start < end and raw_text[start].isspace():
         start += 1
@@ -1847,13 +1857,9 @@ def prepare_cram_test_tensors(df_test, tokenizer, max_len: int = 256, backbone_n
             all_rationale_masks[idx] = rationale_masks
 
         for asp_idx, votes in asp_sent_votes.items():
-            maj_sent = Counter(votes).most_common(1)[0][0]
-            joined_span = " ".join(asp_span_texts[asp_idx]).strip()
-            cal_sent = compute_span_calibrated_sentiment(
-                joined_span if joined_span else raw_text,
-                maj_sent
+            all_aspect_labels[idx, asp_idx] = _calibrate_aspect_vote(
+                votes, asp_span_texts[asp_idx], raw_text
             )
-            all_aspect_labels[idx, asp_idx] = cal_sent
 
     result = {
         "input_ids": all_input_ids,
@@ -1912,6 +1918,7 @@ def prepare_paper1_or_9_test_tensors(df_test, tokenizer, use_wsd: bool = False, 
     for idx in range(n_rows):
         anns = parse_annotations_safe(anns_col[idx])
         votes = defaultdict(list)
+        asp_span_texts = defaultdict(list)
         if use_wsd:
             offsets = all_offsets[idx]
             raw_len = len(raw_texts[idx])
@@ -1921,13 +1928,14 @@ def prepare_paper1_or_9_test_tensors(df_test, tokenizer, use_wsd: bool = False, 
                 if asp in ASPECT_ID_MAP and asp != "None":
                     a_idx = ASPECT_ID_MAP[asp] - 1
                     votes[a_idx].append(SENTIMENT_TO_ID.get(sent, 2))
+                    raw_sp = str(ann.get("span_text", "")).strip()
+                    if raw_sp:
+                        asp_span_texts[a_idx].append(raw_sp)
                     s_c = int(ann.get("start_char", 0))
                     e_c = int(ann.get("end_char", 0))
                     for t_i, (ts, te) in enumerate(offsets):
                         if te > ts and ts < e_c and te > s_c and ts < raw_len:
                             all_rationale_masks[idx, a_idx, t_i] = 1.0
-            for a_idx, v_list in votes.items():
-                all_aspect_labels[idx, a_idx] = Counter(v_list).most_common(1)[0][0]
         else:
             tok_strs = tokenizer.convert_ids_to_tokens(all_input_ids[idx].tolist())
             span_toks_map = defaultdict(set)
@@ -1938,15 +1946,21 @@ def prepare_paper1_or_9_test_tensors(df_test, tokenizer, use_wsd: bool = False, 
                     a_idx = ASPECT_ID_MAP[asp] - 1
                     votes[a_idx].append(SENTIMENT_TO_ID.get(sent, 2))
                     raw_sp = str(ann.get("span_text", "")).strip()
+                    if raw_sp:
+                        asp_span_texts[a_idx].append(raw_sp)
                     span_toks_map[a_idx].update(paper1_clean_text(raw_sp).split())
-            for a_idx, v_list in votes.items():
-                all_aspect_labels[idx, a_idx] = Counter(v_list).most_common(1)[0][0]
+            for a_idx in votes:
                 target_words = span_toks_map[a_idx]
                 if target_words:
                     for t_i, t_str in enumerate(tok_strs):
                         clean_sub = t_str.replace("##", "")
                         if clean_sub in target_words and all_attention_masks[idx, t_i].item() == 1:
                             all_rationale_masks[idx, a_idx, t_i] = 1.0
+
+        for a_idx, v_list in votes.items():
+            all_aspect_labels[idx, a_idx] = _calibrate_aspect_vote(
+                v_list, asp_span_texts[a_idx], raw_texts[idx]
+            )
 
     result = {
         "input_ids": all_input_ids,
@@ -2284,7 +2298,7 @@ def run_test_split_benchmark(
 
                     for local_i, (_, row) in enumerate(batch_df.iterrows()):
                         global_i = s_i + local_i
-                        txt = str(row["review_text"])
+                        txt = unicodedata.normalize("NFC", str(row["review_text"]))
                         toks = paper4_preprocess_tokens(txt)
                         ids = [word2idx[t] for t in toks if t in word2idx][:128]
                         if len(ids) < 128:
@@ -2302,14 +2316,20 @@ def run_test_split_benchmark(
 
                         true_toks_per_asp = defaultdict(set)
                         votes = defaultdict(list)
+                        asp_span_texts = defaultdict(list)
                         for ann in parse_annotations_safe(row.get("aspect_annotations", [])):
                             asp = ann.get("aspect")
                             if asp in ASPECT_ID_MAP and asp != "None":
                                 a_i = ASPECT_ID_MAP[asp] - 1
                                 votes[a_i].append(SENTIMENT_TO_ID.get(ann.get("sentiment", "Neutral"), 2))
+                                raw_sp = str(ann.get("span_text", "")).strip()
+                                if raw_sp:
+                                    asp_span_texts[a_i].append(raw_sp)
                                 true_toks_per_asp[a_i].update(paper4_preprocess_tokens(ann.get("span_text", "")))
                         for a_i, v_l in votes.items():
-                            Y_true_asp[global_i, a_i] = Counter(v_l).most_common(1)[0][0]
+                            Y_true_asp[global_i, a_i] = _calibrate_aspect_vote(
+                                v_l, asp_span_texts[a_i], txt
+                            )
 
                         raw_sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", txt) if s.strip()]
                         if not raw_sents and txt.strip():
