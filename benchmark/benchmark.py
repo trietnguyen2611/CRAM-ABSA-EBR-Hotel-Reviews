@@ -14,6 +14,7 @@ import threading
 import webbrowser
 import unicodedata
 from pathlib import Path
+from contextlib import nullcontext
 from collections import Counter, defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -200,7 +201,7 @@ AMBIGUOUS_HOTEL_TERMS = {
 }
 
 MODEL_EXTENSIONS = {".pt", ".pth", ".bin", ".safetensors", ".ckpt"}
-MAX_CACHED_MODELS = 2
+MAX_CACHED_MODELS = 1 if (TORCH_AVAILABLE and getattr(DEVICE, "type", str(DEVICE)) == "mps") else 2
 LOADED_MODEL_CACHE: Dict[str, Any] = {}
 CURRENT_MODEL_DIR: Optional[Path] = None
 CURRENT_SELECTED_MODEL_FILE: Optional[Path] = None
@@ -233,8 +234,8 @@ def _release_device_memory():
 
 # Cached test split dataframe & pre-tokenized structures to speed up repeated benchmark runs
 _CACHED_TEST_DF: Optional[Any] = None
-_CACHED_BERT_TOK: Optional[Any] = None
-_CACHED_TEST_CRAM_TENSORS: Optional[Dict[str, Any]] = None
+_CACHED_TOKENIZERS: Dict[str, Any] = {}
+_CACHED_TEST_CRAM_TENSORS: Dict[Tuple[str, int], Dict[str, Any]] = {}
 _CACHED_TEST_P1_TENSORS: Optional[Dict[str, Any]] = None
 _CACHED_TEST_P9_TENSORS: Optional[Dict[str, Any]] = None
 _LEMMA_CACHE: Dict[str, str] = {}
@@ -1023,6 +1024,11 @@ def extract_18_features_for_new_review(review_text: str) -> np.ndarray:
 
 
 if TORCH_AVAILABLE:
+    def _get_eval_amp_context():
+        if getattr(DEVICE, "type", str(DEVICE)) == "mps" and hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+            return torch.amp.autocast(device_type="mps", dtype=torch.bfloat16)
+        return nullcontext()
+
     def decode_corn_predictions(corn_logits: torch.Tensor) -> torch.Tensor:
         probs = torch.sigmoid(corn_logits)
         cum_probs = torch.cumprod(probs, dim=-1)
@@ -1045,7 +1051,7 @@ if TORCH_AVAILABLE:
         """Shared multi-polarity segment extraction for transformer models."""
         aspect_name = CANONICAL_ASPECTS[aspect_idx]
         valid_len = int(attention_mask[0].sum().item())
-        rat_probs_all = outputs["rationale_probs"][0, :, :valid_len].detach().cpu().numpy()
+        rat_probs_all = outputs["rationale_probs"][0, :, :valid_len].detach().float().cpu().numpy()
         tok_ids = input_ids[0, :valid_len].detach().cpu().tolist()
 
         norm_text = unicodedata.normalize("NFC", str(raw_text or "").strip())
@@ -1075,7 +1081,7 @@ if TORCH_AVAILABLE:
         tok_pol_probs_all = None
         if has_trained_token_polarity and "token_polarity_logits" in outputs:
             tok_pol_probs_all = F.softmax(
-                outputs["token_polarity_logits"][0, :valid_len].detach().cpu(), dim=-1
+                outputs["token_polarity_logits"][0, :valid_len].detach().float().cpu(), dim=-1
             ).numpy()
 
         clause_model_scores: List[float] = []
@@ -1136,19 +1142,44 @@ if TORCH_AVAILABLE:
         )
 
     class CRAM_ABSA_MultiAspectModel(nn.Module):
-        def __init__(self, backbone_name="bert-base-uncased", hidden_dim=768, num_features=20, proj_dim=256, attn_heads=8, num_aspects=6, num_sent_classes=4, corn_out_dim=2, max_comment_len=48, use_cross_attn=True):
+        def __init__(
+            self,
+            backbone_name="bert-base-uncased",
+            hidden_dim=768,
+            num_features=20,
+            proj_dim=256,
+            attn_heads=8,
+            num_aspects=6,
+            num_sent_classes=4,
+            corn_out_dim=2,
+            max_comment_len=48,
+            use_cross_attn=True,
+            use_mlp_multi_pol=False,
+            attn_implementation=None,
+        ):
             super().__init__()
             self.num_aspects = num_aspects
             self.num_sent_classes = num_sent_classes
             self.corn_out_dim = corn_out_dim
-            self.hidden_dim = hidden_dim
             self.max_comment_len = max_comment_len
             self.use_cross_attn = use_cross_attn
+            self.use_mlp_multi_pol = bool(use_mlp_multi_pol)
             self.canonical_aspects = list(CANONICAL_ASPECTS)
             self.has_trained_token_polarity = False
             self.has_trained_multi_pol = False
 
-            self.bert = AutoModel.from_pretrained(backbone_name)
+            attn_impl = (
+                attn_implementation
+                if attn_implementation is not None
+                else ("sdpa" if getattr(DEVICE, "type", str(DEVICE)) == "mps" else "eager")
+            )
+            try:
+                self.bert = AutoModel.from_pretrained(backbone_name, attn_implementation=attn_impl)
+            except Exception:
+                self.bert = AutoModel.from_pretrained(backbone_name)
+
+            self.hidden_dim = int(getattr(self.bert.config, "hidden_size", getattr(self.bert.config, "dim", hidden_dim)))
+            self.attn_heads = next(h for h in (attn_heads, 8, 6, 4, 2, 1) if self.hidden_dim % h == 0)
             self.vocab_size = self.bert.config.vocab_size
 
             self.feature_proj = nn.Sequential(
@@ -1156,19 +1187,19 @@ if TORCH_AVAILABLE:
                 nn.LayerNorm(proj_dim),
                 nn.GELU(),
                 nn.Dropout(0.15),
-                nn.Linear(proj_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim)
+                nn.Linear(proj_dim, self.hidden_dim),
+                nn.LayerNorm(self.hidden_dim)
             )
             self.residual_gate = nn.Parameter(torch.tensor(0.28))
-            self.ebr_aspect_prototypes = nn.Parameter(torch.randn(num_aspects, hidden_dim) * 0.02)
+            self.ebr_aspect_prototypes = nn.Parameter(torch.randn(num_aspects, self.hidden_dim) * 0.02)
             if use_cross_attn:
-                self.aspect_cross_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=attn_heads, dropout=0.1, batch_first=True)
-            self.rationale_proj = nn.Linear(hidden_dim, hidden_dim)
+                self.aspect_cross_attn = nn.MultiheadAttention(embed_dim=self.hidden_dim, num_heads=self.attn_heads, dropout=0.1, batch_first=True)
+            self.rationale_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
             self.rationale_bias = nn.Parameter(torch.zeros(num_aspects, 1))
 
             self.aspect_classifiers = nn.ModuleList([
                 nn.Sequential(
-                    nn.Linear(hidden_dim * 2, proj_dim),
+                    nn.Linear(self.hidden_dim * 2, proj_dim),
                     nn.LayerNorm(proj_dim),
                     nn.GELU(),
                     nn.Dropout(0.20),
@@ -1176,20 +1207,29 @@ if TORCH_AVAILABLE:
                 )
                 for _ in range(num_aspects)
             ])
-            self.aspect_multi_pol_head = nn.Linear(hidden_dim * 2, 3)
-            self.token_polarity_proj = nn.Linear(hidden_dim, 3)
+            if self.use_mlp_multi_pol:
+                self.aspect_multi_pol_head = nn.Sequential(
+                    nn.Linear(self.hidden_dim * 2, proj_dim),
+                    nn.LayerNorm(proj_dim),
+                    nn.GELU(),
+                    nn.Dropout(0.20),
+                    nn.Linear(proj_dim, 3)
+                )
+            else:
+                self.aspect_multi_pol_head = nn.Linear(self.hidden_dim * 2, 3)
+            self.token_polarity_proj = nn.Linear(self.hidden_dim, 3)
 
             self.corn_head = nn.Sequential(
-                nn.Linear(hidden_dim * 2, proj_dim),
+                nn.Linear(self.hidden_dim * 2, proj_dim),
                 nn.LayerNorm(proj_dim),
                 nn.GELU(),
                 nn.Dropout(0.20),
                 nn.Linear(proj_dim, corn_out_dim)
             )
 
-            self.commentary_gru = nn.GRU(input_size=hidden_dim, hidden_size=hidden_dim, num_layers=1, batch_first=True)
-            self.commentary_out = nn.Linear(hidden_dim, self.vocab_size, bias=False)
-            self.commentary_out.weight = self.bert.embeddings.word_embeddings.weight
+            self.commentary_gru = nn.GRU(input_size=self.hidden_dim, hidden_size=self.hidden_dim, num_layers=1, batch_first=True)
+            self.commentary_out = nn.Linear(self.hidden_dim, self.vocab_size, bias=False)
+            self.commentary_out.weight = self.bert.get_input_embeddings().weight
 
         def forward(self, input_ids, attention_mask, dense_features):
             bsz = input_ids.size(0)
@@ -1197,57 +1237,69 @@ if TORCH_AVAILABLE:
             seq_hidden = bert_out.last_hidden_state
             cls_hidden = seq_hidden[:, 0, :]
 
-            feat_emb = self.feature_proj(dense_features)
-            conditioned_seq = seq_hidden + self.residual_gate * feat_emb.unsqueeze(1)
-            conditioned_cls = cls_hidden + feat_emb
+            use_mps_fp32 = (input_ids.device.type == "mps")
+            head_ctx = torch.amp.autocast(device_type="mps", enabled=False) if use_mps_fp32 else nullcontext()
+            with head_ctx:
+                if use_mps_fp32:
+                    seq_hidden = seq_hidden.float()
+                    cls_hidden = cls_hidden.float()
+                    dense_in = dense_features.float()
+                else:
+                    dense_in = dense_features
 
-            token_proj = self.rationale_proj(conditioned_seq)
-            proto_norm = F.normalize(self.ebr_aspect_prototypes, p=2, dim=-1)
-            token_norm = F.normalize(token_proj, p=2, dim=-1)
-            bilinear_scores = torch.einsum("bld,ad->bal", token_proj, self.ebr_aspect_prototypes) / math.sqrt(self.hidden_dim)
-            cosine_scores = torch.einsum("bld,ad->bal", token_norm, proto_norm)
+                feat_emb = self.feature_proj(dense_in)
+                conditioned_seq = seq_hidden + self.residual_gate * feat_emb.unsqueeze(1)
+                conditioned_cls = cls_hidden + feat_emb
 
-            if self.use_cross_attn and hasattr(self, "aspect_cross_attn"):
-                queries = self.ebr_aspect_prototypes.unsqueeze(0).expand(bsz, -1, -1)
-                cross_ctx, cross_attn_weights = self.aspect_cross_attn(
-                    query=queries,
-                    key=conditioned_seq,
-                    value=conditioned_seq,
-                    key_padding_mask=(attention_mask == 0),
-                    need_weights=True
-                )
-                valid_len = attention_mask.sum(dim=-1, keepdim=True).unsqueeze(1).float().clamp(min=1.0)
-                rel_attn = (cross_attn_weights * valid_len).clamp(min=1e-4)
-                raw_rat_logits = bilinear_scores + cosine_scores + 0.5 * torch.log(rel_attn) + self.rationale_bias
-            else:
-                cross_ctx = None
-                raw_rat_logits = bilinear_scores + cosine_scores + self.rationale_bias
+                token_proj = self.rationale_proj(conditioned_seq)
+                proto_norm = F.normalize(self.ebr_aspect_prototypes, p=2, dim=-1)
+                token_norm = F.normalize(token_proj, p=2, dim=-1)
+                bilinear_scores = torch.einsum("bld,ad->bal", token_proj, self.ebr_aspect_prototypes) / math.sqrt(self.hidden_dim)
+                cosine_scores = torch.einsum("bld,ad->bal", token_norm, proto_norm)
 
-            pad_mask = attention_mask.unsqueeze(1).float()
-            raw_rat_probs = torch.sigmoid(raw_rat_logits) * pad_mask
+                if self.use_cross_attn and hasattr(self, "aspect_cross_attn"):
+                    queries = self.ebr_aspect_prototypes.unsqueeze(0).expand(bsz, -1, -1)
+                    if queries.dtype != conditioned_seq.dtype:
+                        queries = queries.to(dtype=conditioned_seq.dtype)
+                    cross_ctx, cross_attn_weights = self.aspect_cross_attn(
+                        query=queries,
+                        key=conditioned_seq,
+                        value=conditioned_seq,
+                        key_padding_mask=(attention_mask == 0),
+                        need_weights=True
+                    )
+                    valid_len = attention_mask.sum(dim=-1, keepdim=True).unsqueeze(1).float().clamp(min=1.0)
+                    rel_attn = (cross_attn_weights * valid_len).clamp(min=1e-4)
+                    raw_rat_logits = bilinear_scores + cosine_scores + 0.5 * torch.log(rel_attn) + self.rationale_bias
+                else:
+                    cross_ctx = None
+                    raw_rat_logits = bilinear_scores + cosine_scores + self.rationale_bias
 
-            denom = raw_rat_probs.sum(dim=-1, keepdim=True).clamp(min=1e-4)
-            rat_pooled = torch.einsum("bal,bld->bad", raw_rat_probs, conditioned_seq) / denom
-            masked_pooled = 0.55 * rat_pooled + 0.45 * cross_ctx if cross_ctx is not None else rat_pooled
+                pad_mask = attention_mask.unsqueeze(1).float()
+                raw_rat_probs = torch.sigmoid(raw_rat_logits) * pad_mask
 
-            aspect_logits_list = []
-            multi_pol_logits_list = []
-            for a_idx in range(self.num_aspects):
-                asp_ctx = torch.cat([masked_pooled[:, a_idx, :], feat_emb], dim=-1)
-                aspect_logits_list.append(self.aspect_classifiers[a_idx](asp_ctx))
-                multi_pol_logits_list.append(self.aspect_multi_pol_head(asp_ctx))
+                denom = raw_rat_probs.sum(dim=-1, keepdim=True).clamp(min=1e-4)
+                rat_pooled = torch.einsum("bal,bld->bad", raw_rat_probs, conditioned_seq) / denom
+                masked_pooled = 0.55 * rat_pooled + 0.45 * cross_ctx if cross_ctx is not None else rat_pooled
 
-            aspect_logits = torch.stack(aspect_logits_list, dim=1)
-            aspect_multi_pol_logits = torch.stack(multi_pol_logits_list, dim=1)
-            token_polarity_logits = self.token_polarity_proj(conditioned_seq)
+                aspect_logits_list = []
+                multi_pol_logits_list = []
+                for a_idx in range(self.num_aspects):
+                    asp_ctx = torch.cat([masked_pooled[:, a_idx, :], feat_emb], dim=-1)
+                    aspect_logits_list.append(self.aspect_classifiers[a_idx](asp_ctx))
+                    multi_pol_logits_list.append(self.aspect_multi_pol_head(asp_ctx))
 
-            asp_present_logit = (aspect_logits[:, :, 1:].logsumexp(dim=-1, keepdim=True) - aspect_logits[:, :, 0:1]).detach()
-            rationale_logits = raw_rat_logits + 0.35 * asp_present_logit.clamp(min=-6.0, max=4.0)
-            rationale_probs = torch.sigmoid(rationale_logits) * pad_mask
+                aspect_logits = torch.stack(aspect_logits_list, dim=1)
+                aspect_multi_pol_logits = torch.stack(multi_pol_logits_list, dim=1)
+                token_polarity_logits = self.token_polarity_proj(conditioned_seq)
 
-            global_aspect_ctx = masked_pooled.mean(dim=1)
-            corn_input = torch.cat([conditioned_cls, global_aspect_ctx], dim=-1)
-            corn_logits = self.corn_head(corn_input)
+                asp_present_logit = (aspect_logits[:, :, 1:].logsumexp(dim=-1, keepdim=True) - aspect_logits[:, :, 0:1]).detach()
+                rationale_logits = raw_rat_logits + 0.35 * asp_present_logit.clamp(min=-6.0, max=4.0)
+                rationale_probs = torch.sigmoid(rationale_logits) * pad_mask
+
+                global_aspect_ctx = masked_pooled.mean(dim=1)
+                corn_input = torch.cat([conditioned_cls, global_aspect_ctx], dim=-1)
+                corn_logits = self.corn_head(corn_input)
 
             return {
                 "aspect_logits": aspect_logits,
@@ -1260,31 +1312,35 @@ if TORCH_AVAILABLE:
                 "seq_hidden": conditioned_seq
             }
 
-        @torch.no_grad()
+        @torch.inference_mode()
         def _decode_gru_token_set(self, aspect_idx: int, outputs: Dict[str, torch.Tensor], input_ids: torch.Tensor, attention_mask: torch.Tensor, tokenizer) -> set:
             valid_len = int(attention_mask[0].sum().item())
             tok_ids = input_ids[0, :valid_len]
 
-            h_state = outputs["aspect_embeddings"][:, aspect_idx, :].unsqueeze(0).contiguous()
-            cur_tok = torch.tensor([[tokenizer.cls_token_id]], dtype=torch.long, device=input_ids.device)
-            gen_ids = []
+            use_mps_fp32 = (input_ids.device.type == "mps")
+            gru_ctx = torch.amp.autocast(device_type="mps", enabled=False) if use_mps_fp32 else nullcontext()
+            with gru_ctx:
+                h_state = outputs["aspect_embeddings"][:, aspect_idx, :].unsqueeze(0).float().contiguous()
+                cur_tok = torch.tensor([[tokenizer.cls_token_id]], dtype=torch.long, device=input_ids.device)
+                gen_ids = []
 
-            allowed_tokens = set(tok_ids.tolist()) | {tokenizer.sep_token_id, tokenizer.pad_token_id}
-            vocab_mask = torch.full((self.vocab_size,), -1e4, device=input_ids.device)
-            for tid in allowed_tokens:
-                vocab_mask[tid] = 0.0
+                allowed_tokens = set(tok_ids.tolist()) | {tokenizer.sep_token_id, tokenizer.pad_token_id}
+                vocab_mask = torch.full((self.vocab_size,), -1e4, device=input_ids.device, dtype=torch.float32)
+                for tid in allowed_tokens:
+                    vocab_mask[tid] = 0.0
 
-            for _ in range(self.max_comment_len - 1):
-                emb = self.bert.embeddings.word_embeddings(cur_tok)
-                dec_out, h_state = self.commentary_gru(emb, h_state)
-                step_logits = self.commentary_out(dec_out[:, -1, :]).squeeze(0) + vocab_mask
-                for prev_id in gen_ids[-4:]:
-                    step_logits[prev_id] -= 3.0
-                next_id = int(torch.argmax(step_logits).item())
-                if next_id in (tokenizer.sep_token_id, tokenizer.pad_token_id, tokenizer.cls_token_id):
-                    break
-                gen_ids.append(next_id)
-                cur_tok = torch.tensor([[next_id]], dtype=torch.long, device=input_ids.device)
+                word_embedder = self.bert.get_input_embeddings()
+                for _ in range(self.max_comment_len - 1):
+                    emb = word_embedder(cur_tok).float()
+                    dec_out, h_state = self.commentary_gru(emb, h_state)
+                    step_logits = self.commentary_out(dec_out[:, -1, :].float()).squeeze(0) + vocab_mask
+                    for prev_id in gen_ids[-4:]:
+                        step_logits[prev_id] -= 3.0
+                    next_id = int(torch.argmax(step_logits).item())
+                    if next_id in (tokenizer.sep_token_id, tokenizer.pad_token_id, tokenizer.cls_token_id):
+                        break
+                    gen_ids.append(next_id)
+                    cur_tok = torch.tensor([[next_id]], dtype=torch.long, device=input_ids.device)
 
             return set(gen_ids)
 
@@ -1351,13 +1407,16 @@ if TORCH_AVAILABLE:
 
         def forward(self, input_ids, attention_mask):
             out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-            seq_h = out.last_hidden_state
-            cls_h = seq_h[:, 0, :]
-            tok_scores = torch.sigmoid(self.token_scorer(seq_h)).transpose(1, 2) * attention_mask.unsqueeze(1).float()
-            return {
-                "aspect_logits": torch.stack([head(cls_h) for head in self.aspect_heads], dim=1),
-                "rationale_probs": tok_scores
-            }
+            use_mps_fp32 = (input_ids.device.type == "mps")
+            head_ctx = torch.amp.autocast(device_type="mps", enabled=False) if use_mps_fp32 else nullcontext()
+            with head_ctx:
+                seq_h = out.last_hidden_state.float() if use_mps_fp32 else out.last_hidden_state
+                cls_h = seq_h[:, 0, :]
+                tok_scores = torch.sigmoid(self.token_scorer(seq_h)).transpose(1, 2) * attention_mask.unsqueeze(1).float()
+                return {
+                    "aspect_logits": torch.stack([head(cls_h) for head in self.aspect_heads], dim=1),
+                    "rationale_probs": tok_scores
+                }
 
         @torch.no_grad()
         def extract_aspect_segments(
@@ -1424,7 +1483,8 @@ if TORCH_AVAILABLE:
             self.dropout = nn.Dropout(dropout)
 
         def forward(self, x: torch.Tensor, norm_adj: torch.Tensor) -> torch.Tensor:
-            return self.dropout(F.relu(torch.bmm(norm_adj, self.linear(x))))
+            h = self.linear(x)
+            return self.dropout(F.relu(torch.bmm(norm_adj.to(dtype=h.dtype), h)))
 
 
     class Paper9WSD_BiLSTM_GCN(nn.Module):
@@ -1447,33 +1507,36 @@ if TORCH_AVAILABLE:
             if input_ids.is_cuda:
                 self.bilstm.flatten_parameters()
             bert_out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-            seq_emb = bert_out.last_hidden_state
-            lstm_out = self.bilstm_dropout(self.bilstm(seq_emb)[0])
+            use_mps_fp32 = (input_ids.device.type == "mps")
+            head_ctx = torch.amp.autocast(device_type="mps", enabled=False) if use_mps_fp32 else nullcontext()
+            with head_ctx:
+                seq_emb = bert_out.last_hidden_state.float() if use_mps_fp32 else bert_out.last_hidden_state
+                lstm_out = self.bilstm_dropout(self.bilstm(seq_emb)[0])
 
-            idx = torch.arange(seq_len, device=attention_mask.device)
-            local_adj = ((idx.unsqueeze(0) - idx.unsqueeze(1)).abs() <= 2).float().unsqueeze(0).expand(bsz, -1, -1)
-            adj = local_adj * (attention_mask.unsqueeze(1).float() * attention_mask.unsqueeze(2).float())
-            adj[:, 0, :] = attention_mask.float()
-            adj[:, :, 0] = attention_mask.float()
-            inv_sqrt_deg = adj.sum(dim=-1, keepdim=True).clamp(min=1.0).pow(-0.5)
-            norm_adj = inv_sqrt_deg * adj * inv_sqrt_deg.transpose(1, 2)
+                idx = torch.arange(seq_len, device=attention_mask.device)
+                local_adj = ((idx.unsqueeze(0) - idx.unsqueeze(1)).abs() <= 2).float().unsqueeze(0).expand(bsz, -1, -1)
+                adj = local_adj * (attention_mask.unsqueeze(1).float() * attention_mask.unsqueeze(2).float())
+                adj[:, 0, :] = attention_mask.float()
+                adj[:, :, 0] = attention_mask.float()
+                inv_sqrt_deg = adj.sum(dim=-1, keepdim=True).clamp(min=1.0).pow(-0.5)
+                norm_adj = inv_sqrt_deg * adj * inv_sqrt_deg.transpose(1, 2)
 
-            gcn_h = self.gcn2(self.gcn1(seq_emb, norm_adj), norm_adj)
-            pad_mask = (attention_mask == 0).unsqueeze(1)
-            attn_scores = (torch.einsum("bld,ad->bal", lstm_out, self.attn_queries) / math.sqrt(lstm_out.size(-1))).masked_fill(pad_mask, -1e4)
-            attn_weights = F.softmax(attn_scores, dim=-1)
-            rationale_probs = torch.sigmoid(attn_scores) * attention_mask.unsqueeze(1).float()
+                gcn_h = self.gcn2(self.gcn1(seq_emb, norm_adj), norm_adj)
+                pad_mask = (attention_mask == 0).unsqueeze(1)
+                attn_scores = (torch.einsum("bld,ad->bal", lstm_out, self.attn_queries) / math.sqrt(lstm_out.size(-1))).masked_fill(pad_mask, -1e4)
+                attn_weights = F.softmax(attn_scores, dim=-1)
+                rationale_probs = torch.sigmoid(attn_scores) * attention_mask.unsqueeze(1).float()
 
-            lstm_Side = torch.einsum("bal,bld->bad", attn_weights, lstm_out)
-            gcn_Side = torch.einsum("bal,bld->bad", attn_weights, gcn_h)
-            w = torch.sigmoid(self.fusion_gate)
-            combined = torch.cat([w * lstm_Side, (1.0 - w) * gcn_Side], dim=-1)
+                lstm_Side = torch.einsum("bal,bld->bad", attn_weights, lstm_out)
+                gcn_Side = torch.einsum("bal,bld->bad", attn_weights, gcn_h)
+                w = torch.sigmoid(self.fusion_gate)
+                combined = torch.cat([w * lstm_Side, (1.0 - w) * gcn_Side], dim=-1)
 
-            asp_logits = torch.stack([self.aspect_classifiers[a](combined[:, a, :]) for a in range(self.num_aspects)], dim=1)
-            return {
-                "aspect_logits": asp_logits,
-                "rationale_probs": rationale_probs
-            }
+                asp_logits = torch.stack([self.aspect_classifiers[a](combined[:, a, :]) for a in range(self.num_aspects)], dim=1)
+                return {
+                    "aspect_logits": asp_logits,
+                    "rationale_probs": rationale_probs
+                }
 
         @torch.no_grad()
         def extract_aspect_segments(
@@ -1510,11 +1573,13 @@ if TORCH_AVAILABLE:
             return " ".join(seg["text"] for seg in segs).strip() or review_text.strip()
 
 
-def get_shared_bert_tokenizer():
-    global _CACHED_BERT_TOK
-    if _CACHED_BERT_TOK is None:
-        _CACHED_BERT_TOK = AutoTokenizer.from_pretrained("bert-base-uncased")
-    return _CACHED_BERT_TOK
+def get_shared_bert_tokenizer(backbone_name: str = "bert-base-uncased"):
+    key = str(backbone_name or "bert-base-uncased")
+    tok = _CACHED_TOKENIZERS.get(key)
+    if tok is None:
+        tok = AutoTokenizer.from_pretrained(key)
+        _CACHED_TOKENIZERS[key] = tok
+    return tok
 
 
 def load_model_bundle(model_path: Path) -> Dict[str, Any]:
@@ -1546,9 +1611,23 @@ def load_model_bundle(model_path: Path) -> Dict[str, Any]:
         else:
             arch = "cram_absa"
 
-    tok = get_shared_bert_tokenizer() if arch != "paper4_bm25_tfigm_svm_cnn" else None
+    if arch in ("paper1_bert", "paper9_wsd_bilstm_gcn"):
+        backbone_name = str(ckpt.get("backbone_name") or "bert-base-uncased")
+        max_seq_len = int(ckpt.get("max_seq_len") or 256)
+    elif arch == "paper4_bm25_tfigm_svm_cnn":
+        backbone_name = "paper4"
+        max_seq_len = 128
+    else:
+        hidden_dim = int(ckpt.get("hidden_dim") or (raw_sd["rationale_proj.weight"].shape[0] if "rationale_proj.weight" in raw_sd else 768))
+        backbone_name = ckpt.get("backbone_name") or ("bert-base-uncased" if hidden_dim == 768 else "BAAI/bge-small-en-v1.5")
+        proj_dim = int(ckpt.get("proj_dim") or (raw_sd["feature_proj.0.weight"].shape[0] if "feature_proj.0.weight" in raw_sd else 256))
+        attn_heads = int(ckpt.get("attn_heads") or (6 if hidden_dim == 384 else 8))
+        use_mlp_mp = ("aspect_multi_pol_head.0.weight" in state_keys)
+        max_seq_len = int(ckpt.get("max_seq_len") or 256)
+
+    tok = get_shared_bert_tokenizer(backbone_name) if arch != "paper4_bm25_tfigm_svm_cnn" else None
     if arch == "paper1_bert":
-        net = Paper1BERTModel()
+        net = Paper1BERTModel(backbone_name=backbone_name)
         # Remap legacy Paper 1 keys (aspect_hidden_layers.{i}.0.* + aspect_heads.{i}.weight/bias)
         for i in range(6):
             hk_w = f"aspect_hidden_layers.{i}.0.weight"
@@ -1567,12 +1646,21 @@ def load_model_bundle(model_path: Path) -> Dict[str, Any]:
         v_size = raw_sd["embedding.weight"].shape[0]
         net = Paper4MultiRegionCNN(vocab_size=v_size)
     elif arch == "paper9_wsd_bilstm_gcn":
-        net = Paper9WSD_BiLSTM_GCN()
+        net = Paper9WSD_BiLSTM_GCN(backbone_name=backbone_name)
     else:
         has_cross = any(k.startswith("aspect_cross_attn.") for k in state_keys)
         in_feat = raw_sd["feature_proj.0.weight"].shape[1] if "feature_proj.0.weight" in raw_sd else 20
         corn_dim = raw_sd["corn_head.4.weight"].shape[0] if "corn_head.4.weight" in raw_sd else 2
-        net = CRAM_ABSA_MultiAspectModel(num_features=in_feat, corn_out_dim=corn_dim, use_cross_attn=has_cross)
+        net = CRAM_ABSA_MultiAspectModel(
+            backbone_name=backbone_name,
+            hidden_dim=hidden_dim,
+            num_features=in_feat,
+            proj_dim=proj_dim,
+            attn_heads=attn_heads,
+            corn_out_dim=corn_dim,
+            use_cross_attn=has_cross,
+            use_mlp_multi_pol=use_mlp_mp,
+        )
         arch = "cram_absa"
 
     model_sd = net.state_dict()
@@ -1582,16 +1670,22 @@ def load_model_bundle(model_path: Path) -> Dict[str, Any]:
     }
     net.load_state_dict(compat_sd, strict=False)
     if arch == "cram_absa":
-        net.has_trained_token_polarity = ("token_polarity_proj.weight" in raw_sd)
-        net.has_trained_multi_pol = ("aspect_multi_pol_head.weight" in raw_sd)
+        net.has_trained_token_polarity = ("token_polarity_proj.weight" in state_keys)
+        net.has_trained_multi_pol = ("aspect_multi_pol_head.0.weight" in state_keys or "aspect_multi_pol_head.weight" in state_keys)
     net = net.to(DEVICE)
     net.eval()
+
+    ckpt.pop("model_state_dict", None)
+    del raw_sd, compat_sd, model_sd
+    gc.collect()
 
     bundle = {
         "arch": arch,
         "ckpt": ckpt,
         "model": net,
         "tokenizer": tok,
+        "backbone_name": backbone_name,
+        "max_seq_len": max_seq_len,
         "feat_mean": ckpt.get("feat_mean", None),
         "feat_std": ckpt.get("feat_std", None),
         "epoch": ckpt.get("epoch", "-")
@@ -1600,10 +1694,15 @@ def load_model_bundle(model_path: Path) -> Dict[str, Any]:
     return bundle
 
 
-def prepare_cram_test_tensors(df_test, tokenizer, max_len: int = 256) -> Dict[str, Any]:
-    global _CACHED_TEST_CRAM_TENSORS
-    if _CACHED_TEST_CRAM_TENSORS is not None:
-        return _CACHED_TEST_CRAM_TENSORS
+def prepare_cram_test_tensors(df_test, tokenizer, max_len: int = 256, backbone_name: str = "bert-base-uncased") -> Dict[str, Any]:
+    cache_key = (str(backbone_name or "bert-base-uncased"), int(max_len))
+    if cache_key in _CACHED_TEST_CRAM_TENSORS:
+        return _CACHED_TEST_CRAM_TENSORS[cache_key]
+
+    while len(_CACHED_TEST_CRAM_TENSORS) >= MAX_CACHED_MODELS:
+        oldest_key = next(iter(_CACHED_TEST_CRAM_TENSORS))
+        _CACHED_TEST_CRAM_TENSORS.pop(oldest_key, None)
+        gc.collect()
 
     n_rows = len(df_test)
     raw_texts = [unicodedata.normalize("NFC", str(t)) for t in df_test["review_text"]]
@@ -1629,6 +1728,8 @@ def prepare_cram_test_tensors(df_test, tokenizer, max_len: int = 256) -> Dict[st
         features_raw_20 = np.stack([extract_20_features_for_new_review(t) for t in raw_texts], axis=0)
 
     all_aspect_labels = torch.zeros((n_rows, 6), dtype=torch.long)
+    all_aspect_dual_pol_targets = torch.zeros((n_rows, 6, 3), dtype=torch.float32)
+    all_token_polarity_labels = torch.full((n_rows, max_len), -100, dtype=torch.long)
     all_rationale_masks = torch.zeros((n_rows, 6, max_len), dtype=torch.float32)
     all_sentiment_ids = torch.zeros(n_rows, dtype=torch.long)
 
@@ -1649,13 +1750,18 @@ def prepare_cram_test_tensors(df_test, tokenizer, max_len: int = 256) -> Dict[st
             if asp not in ASPECT_ID_MAP or asp == "None":
                 continue
             asp_idx = ASPECT_ID_MAP[asp] - 1
+            ann_sent_id = SENTIMENT_TO_ID.get(sent, 2)
             s_char = int(ann.get("start_char", 0))
             e_char = int(ann.get("end_char", 0))
             span_txt = str(ann.get("span_text", "")).strip()
-            asp_sent_votes[asp_idx].append(SENTIMENT_TO_ID.get(sent, 2))
+            asp_sent_votes[asp_idx].append(ann_sent_id)
+            all_aspect_dual_pol_targets[idx, asp_idx, ann_sent_id - 1] = 1.0
             if span_txt:
                 asp_span_texts[asp_idx].append(span_txt)
-            valid_anns.append((asp, asp_idx, s_char, e_char))
+                for _, _, sub_str in split_into_opinion_clauses(span_txt):
+                    sub_cal = compute_span_calibrated_sentiment(sub_str, ann_sent_id)
+                    all_aspect_dual_pol_targets[idx, asp_idx, sub_cal - 1] = 1.0
+            valid_anns.append((asp, asp_idx, s_char, e_char, ann_sent_id))
 
         if valid_anns:
             word_spans = []
@@ -1683,8 +1789,16 @@ def prepare_cram_test_tensors(df_test, tokenizer, max_len: int = 256) -> Dict[st
             has_multi_asp = len(asp_sent_votes) > 1
             tok_min_dist = np.full((6, max_len), 999, dtype=np.int32)
             rationale_masks = torch.zeros((6, max_len), dtype=torch.float32)
+            pending_tok_pol: List[Tuple[int, int, int, bool]] = []
 
-            for asp, asp_idx, s_char, e_char in valid_anns:
+            for asp, asp_idx, s_char, e_char, ann_sent_id in valid_anns:
+                raw_span_slice = raw_text[s_char:e_char]
+                sub_clauses = split_into_opinion_clauses(raw_span_slice)
+                clause_pol_ranges = [
+                    (s_char + sub_s, s_char + sub_e, compute_span_calibrated_sentiment(sub_str, ann_sent_id) - 1)
+                    for sub_s, sub_e, sub_str in sub_clauses
+                ] if sub_clauses else [(s_char, e_char, ann_sent_id - 1)]
+
                 span_toks = [
                     t_i for t_i, (tok_s, tok_e) in enumerate(offsets)
                     if tok_e > tok_s and tok_s < e_char and tok_e > s_char
@@ -1693,9 +1807,10 @@ def prepare_cram_test_tensors(df_test, tokenizer, max_len: int = 256) -> Dict[st
                     continue
                 overlaps_other = has_multi_asp and any(
                     (o_idx != asp_idx and max(s_char, o_s) < min(e_char, o_e))
-                    for _, o_idx, o_s, o_e in valid_anns
+                    for _, o_idx, o_s, o_e, _ in valid_anns
                 )
                 kw_toks = [t_i for t_i in span_toks if t_i in tok_aspect_kw[asp]]
+                span_char_len = max(1, e_char - s_char)
                 if overlaps_other and kw_toks:
                     for t_i in span_toks:
                         d = min(abs(t_i - k_i) for k_i in kw_toks)
@@ -1703,12 +1818,23 @@ def prepare_cram_test_tensors(df_test, tokenizer, max_len: int = 256) -> Dict[st
                             rationale_masks[asp_idx, t_i] = 1.0
                             if d < tok_min_dist[asp_idx, t_i]:
                                 tok_min_dist[asp_idx, t_i] = d
+                            tok_s, tok_e = offsets[t_i]
+                            tok_pol = next((cp for cs, ce, cp in clause_pol_ranges if tok_s < ce and tok_e > cs), ann_sent_id - 1)
+                            pending_tok_pol.append((t_i, tok_pol, span_char_len, False))
                 else:
                     for t_i in span_toks:
                         rationale_masks[asp_idx, t_i] = 1.0
                         d = min((abs(t_i - k_i) for k_i in kw_toks), default=50)
                         if d < tok_min_dist[asp_idx, t_i]:
                             tok_min_dist[asp_idx, t_i] = d
+                        tok_s, tok_e = offsets[t_i]
+                        tok_pol = next((cp for cs, ce, cp in clause_pol_ranges if tok_s < ce and tok_e > cs), ann_sent_id - 1)
+                        pending_tok_pol.append((t_i, tok_pol, span_char_len, True))
+
+            pending_tok_pol.sort(key=lambda item: (not item[3], item[2]))
+            for t_i, pol_cls, _, _ in pending_tok_pol:
+                if all_token_polarity_labels[idx, t_i] == -100:
+                    all_token_polarity_labels[idx, t_i] = pol_cls
 
             if has_multi_asp:
                 overlap_tok_indices = torch.where(rationale_masks.sum(dim=0) > 1.0)[0].tolist()
@@ -1729,15 +1855,18 @@ def prepare_cram_test_tensors(df_test, tokenizer, max_len: int = 256) -> Dict[st
             )
             all_aspect_labels[idx, asp_idx] = cal_sent
 
-    _CACHED_TEST_CRAM_TENSORS = {
+    result = {
         "input_ids": all_input_ids,
         "attention_mask": all_attention_masks,
         "features_raw_20": features_raw_20,
         "aspect_sent_labels": all_aspect_labels,
+        "aspect_dual_pol_targets": all_aspect_dual_pol_targets,
+        "token_polarity_labels": all_token_polarity_labels,
         "rationale_masks": all_rationale_masks,
         "sentiment_ids": all_sentiment_ids
     }
-    return _CACHED_TEST_CRAM_TENSORS
+    _CACHED_TEST_CRAM_TENSORS[cache_key] = result
+    return result
 
 
 def prepare_paper1_or_9_test_tensors(df_test, tokenizer, use_wsd: bool = False, max_len: int = 256) -> Dict[str, Any]:
@@ -1855,18 +1984,24 @@ def run_test_split_benchmark(
         ckpt = bundle["ckpt"]
         net = bundle["model"]
         tok = bundle["tokenizer"]
+        backbone_name = str(bundle.get("backbone_name") or "bert-base-uncased")
+        max_seq_len = int(bundle.get("max_seq_len") or 256)
         f_mean = bundle["feat_mean"]
         f_std = bundle["feat_std"]
         epoch_val = bundle["epoch"]
 
         df_test = load_test_dataframe()
         n_samples = len(df_test)
-        batch_size = 32
+        is_mps = (getattr(DEVICE, "type", str(DEVICE)) == "mps")
+        if is_mps:
+            batch_size = 16 if int(getattr(net, "hidden_dim", 768)) <= 384 else 8
+        else:
+            batch_size = 32
 
         if arch == "cram_absa":
             if progress_cb:
                 progress_cb(8.0, f"Đang chuẩn bị dữ liệu tập test ({n_samples} mẫu) cho {display_id}...")
-            t_data = prepare_cram_test_tensors(df_test, tok)
+            t_data = prepare_cram_test_tensors(df_test, tok, max_len=max_seq_len, backbone_name=backbone_name)
             raw_20 = t_data["features_raw_20"]
             in_features = net.feature_proj[0].in_features
             if in_features == 20:
@@ -1893,33 +2028,42 @@ def run_test_split_benchmark(
             total_loss = 0.0
             all_pol_preds, all_pol_trues = [], []
             all_asp_preds, all_asp_trues = [], []
+            mp_preds_list, mp_trues_list = [], []
+            tok_pol_correct, tok_pol_total = 0, 0
             rat_inter, rat_pred_sum, rat_true_sum = 0.0, 0.0, 0.0
             overlap_rates = []
             pos_w = torch.tensor([2.5], device=DEVICE)
+            has_mp = bool(getattr(net, "has_trained_multi_pol", False))
+            has_tp = bool(getattr(net, "has_trained_token_polarity", False))
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 for b_idx in range(total_batches):
                     s_i = b_idx * batch_size
                     e_i = min(n_samples, s_i + batch_size)
-                    input_ids = t_data["input_ids"][s_i:e_i].to(DEVICE)
-                    attention_mask = t_data["attention_mask"][s_i:e_i].to(DEVICE)
+                    attn_raw = t_data["attention_mask"][s_i:e_i]
+                    max_valid = int(attn_raw.sum(dim=1).max().item()) if attn_raw.numel() > 0 else max_seq_len
+                    batch_max_len = min(attn_raw.size(1), max(8, ((max_valid + 7) // 8) * 8))
+
+                    input_ids = t_data["input_ids"][s_i:e_i, :batch_max_len].to(DEVICE)
+                    attention_mask = attn_raw[:, :batch_max_len].to(DEVICE)
                     dense_features = dense_all[s_i:e_i].to(DEVICE)
                     asp_y = t_data["aspect_sent_labels"][s_i:e_i].to(DEVICE)
-                    true_mask = t_data["rationale_masks"][s_i:e_i].to(DEVICE)
+                    true_mask = t_data["rationale_masks"][s_i:e_i, :, :batch_max_len].to(DEVICE)
                     sent_ids = t_data["sentiment_ids"][s_i:e_i]
 
-                    outputs = net(input_ids=input_ids, attention_mask=attention_mask, dense_features=dense_features)
+                    with _get_eval_amp_context():
+                        outputs = net(input_ids=input_ids, attention_mask=attention_mask, dense_features=dense_features)
 
-                    ce_loss = F.cross_entropy(outputs["aspect_logits"].view(-1, 4), asp_y.view(-1)).item()
+                    ce_loss = F.cross_entropy(outputs["aspect_logits"].float().view(-1, 4), asp_y.view(-1)).item()
                     valid_mask = attention_mask.unsqueeze(1).expand_as(true_mask).float()
                     bce_raw = F.binary_cross_entropy_with_logits(
-                        outputs["rationale_logits"], true_mask, pos_weight=pos_w, reduction="none"
+                        outputs["rationale_logits"].float(), true_mask, pos_weight=pos_w, reduction="none"
                     )
                     loss_rat = ((bce_raw * valid_mask).sum() / valid_mask.sum().clamp(min=1.0)).item()
                     total_loss += (ce_loss + 0.15 * loss_rat)
 
                     if net.corn_out_dim == 2:
-                        rev_pol_preds = decode_corn_predictions(outputs["corn_logits"]).cpu().numpy()
+                        rev_pol_preds = decode_corn_predictions(outputs["corn_logits"].float()).cpu().numpy()
                         rev_pol_trues = sent_ids.numpy()
                         all_pol_preds.append(rev_pol_preds)
                         all_pol_trues.append(rev_pol_trues)
@@ -1936,7 +2080,7 @@ def run_test_split_benchmark(
                     all_asp_trues.append(asp_true_np)
 
                     active_asp_gate = (asp_preds > 0).unsqueeze(-1).float()
-                    gated_probs = outputs["rationale_probs"] * active_asp_gate
+                    gated_probs = outputs["rationale_probs"].float() * active_asp_gate
                     max_prob_per_tok = gated_probs.max(dim=1, keepdim=True).values
                     pred_mask = ((gated_probs >= 0.5) & (gated_probs >= max_prob_per_tok * 0.92)).float()
 
@@ -1948,6 +2092,23 @@ def run_test_split_benchmark(
                     leaked_toks = (active_asp_per_tok > 1.0).float().sum().item()
                     active_toks = (active_asp_per_tok >= 1.0).float().sum().item()
                     overlap_rates.append(leaked_toks / max(active_toks, 1.0))
+
+                    if has_mp and "aspect_multi_pol_logits" in outputs and "aspect_dual_pol_targets" in t_data:
+                        mp_pred = (torch.sigmoid(outputs["aspect_multi_pol_logits"].float()) >= 0.5).cpu().numpy().reshape(-1, 3)
+                        mp_true = (t_data["aspect_dual_pol_targets"][s_i:e_i].numpy() >= 0.5).reshape(-1, 3)
+                        mp_preds_list.append(mp_pred)
+                        mp_trues_list.append(mp_true)
+
+                    if has_tp and "token_polarity_logits" in outputs and "token_polarity_labels" in t_data:
+                        t_lbl = t_data["token_polarity_labels"][s_i:e_i, :batch_max_len].to(DEVICE).reshape(-1)
+                        t_valid = (t_lbl != -100)
+                        if t_valid.any():
+                            t_pred = outputs["token_polarity_logits"].float().reshape(-1, 3).argmax(dim=-1)
+                            tok_pol_correct += int((t_pred[t_valid] == t_lbl[t_valid]).sum().item())
+                            tok_pol_total += int(t_valid.sum().item())
+
+                    if is_mps and (b_idx + 1) % 25 == 0 and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+                        torch.mps.empty_cache()
 
                     if progress_cb:
                         pct = 10.0 + 88.0 * ((b_idx + 1) / total_batches)
@@ -1975,9 +2136,19 @@ def run_test_split_benchmark(
             macro_aspect_f1 = float(np.mean(aspect_f1s))
             rationale_f1 = (2.0 * rat_inter / max(rat_pred_sum + rat_true_sum, 1.0)) * 100.0
             leakage_rate = float(np.mean(overlap_rates)) * 100.0 if overlap_rates else 0.0
+            multi_pol_f1 = None
+            if has_mp and mp_preds_list:
+                mp_p = np.vstack(mp_preds_list)
+                mp_t = np.vstack(mp_trues_list)
+                multi_pol_f1 = round(float(f1_score(mp_t, mp_p, average="micro", zero_division=0) * 100.0), 2)
+            tok_pol_acc = (
+                round((tok_pol_correct / max(tok_pol_total, 1)) * 100.0, 2)
+                if has_tp and tok_pol_total > 0
+                else None
+            )
             _release_device_memory()
 
-            return {
+            res = {
                 "model": display_id,
                 "epoch": epoch_val,
                 "val_loss": round(total_loss / total_batches, 4),
@@ -1987,12 +2158,17 @@ def run_test_split_benchmark(
                 "rationale_f1": round(rationale_f1, 2),
                 "leakage_rate": round(leakage_rate, 2)
             }
+            if multi_pol_f1 is not None:
+                res["multi_pol_f1"] = multi_pol_f1
+            if tok_pol_acc is not None:
+                res["tok_pol_acc"] = tok_pol_acc
+            return res
 
         elif arch in ("paper1_bert", "paper9_wsd_bilstm_gcn"):
             use_wsd = (arch == "paper9_wsd_bilstm_gcn")
             if progress_cb:
                 progress_cb(8.0, f"Đang tiền xử lý tập test ({n_samples} mẫu) cho {display_id}...")
-            t_data = prepare_paper1_or_9_test_tensors(df_test, tok, use_wsd=use_wsd)
+            t_data = prepare_paper1_or_9_test_tensors(df_test, tok, use_wsd=use_wsd, max_len=max_seq_len)
             total_batches = max(1, math.ceil(n_samples / batch_size))
 
             total_loss = 0.0
@@ -2000,7 +2176,7 @@ def run_test_split_benchmark(
             rat_inter, rat_pred_sum, rat_true_sum = 0.0, 0.0, 0.0
             overlap_rates = []
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 for b_idx in range(total_batches):
                     s_i = b_idx * batch_size
                     e_i = min(n_samples, s_i + batch_size)
@@ -2009,10 +2185,11 @@ def run_test_split_benchmark(
                     asp_y = t_data["aspect_sent_labels"][s_i:e_i].to(DEVICE)
                     rat_mask = t_data["rationale_masks"][s_i:e_i].to(DEVICE)
 
-                    outputs = net(input_ids=input_ids, attention_mask=attention_mask)
+                    with _get_eval_amp_context():
+                        outputs = net(input_ids=input_ids, attention_mask=attention_mask)
                     loss = (
-                        F.cross_entropy(outputs["aspect_logits"].view(-1, 4), asp_y.view(-1))
-                        + 0.25 * F.binary_cross_entropy(outputs["rationale_probs"].clamp(1e-6, 1.0 - 1e-6), rat_mask)
+                        F.cross_entropy(outputs["aspect_logits"].float().view(-1, 4), asp_y.view(-1))
+                        + 0.25 * F.binary_cross_entropy(outputs["rationale_probs"].float().clamp(1e-6, 1.0 - 1e-6), rat_mask)
                     )
                     total_loss += loss.item()
 
@@ -2020,7 +2197,7 @@ def run_test_split_benchmark(
                     asp_pol_preds.append(outputs["aspect_logits"][:, :, 1:4].argmax(dim=-1).cpu().numpy())
                     asp_trues.append(asp_y.cpu().numpy())
 
-                    pred_mask = (outputs["rationale_probs"] >= 0.5).float()
+                    pred_mask = (outputs["rationale_probs"].float() >= 0.5).float()
                     rat_inter += (pred_mask * rat_mask).sum().item()
                     rat_pred_sum += pred_mask.sum().item()
                     rat_true_sum += rat_mask.sum().item()
@@ -2029,6 +2206,9 @@ def run_test_split_benchmark(
                     leaked = (active_per_tok > 1.0).float().sum().item()
                     active = (active_per_tok >= 1.0).float().sum().item()
                     overlap_rates.append(leaked / max(active, 1.0))
+
+                    if is_mps and (b_idx + 1) % 25 == 0 and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+                        torch.mps.empty_cache()
 
                     if progress_cb:
                         pct = 10.0 + 88.0 * ((b_idx + 1) / total_batches)
@@ -2093,7 +2273,7 @@ def run_test_split_benchmark(
             p4_batch = 64
             total_batches = max(1, math.ceil(n_samples / p4_batch))
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 for b_idx in range(total_batches):
                     s_i = b_idx * p4_batch
                     e_i = min(n_samples, s_i + p4_batch)
@@ -2268,37 +2448,28 @@ def get_benchmark_data(selected_model_key: str) -> Dict[str, Any]:
     with BENCHMARK_LOCK:
         all_rows = list(BENCHMARK_HISTORY.values())
 
+    def _build_selected_metrics(r: Dict[str, Any]) -> Dict[str, Any]:
+        metrics = {
+            "acc_at_0": r["acc_at_0"],
+            "aspect_macro_f1": r["aspect_macro_f1"],
+            "macro_mae": r["macro_mae"],
+            "rationale_f1": r["rationale_f1"],
+            "leakage_rate": r["leakage_rate"],
+            "val_loss": r["val_loss"]
+        }
+        if "multi_pol_f1" in r:
+            metrics["multi_pol_f1"] = r["multi_pol_f1"]
+        if "tok_pol_acc" in r:
+            metrics["tok_pol_acc"] = r["tok_pol_acc"]
+        return metrics
+
     selected_metrics = None
     if selected_abs_key and selected_abs_key in BENCHMARK_HISTORY:
-        r = BENCHMARK_HISTORY[selected_abs_key]
-        selected_metrics = {
-            "acc_at_0": r["acc_at_0"],
-            "aspect_macro_f1": r["aspect_macro_f1"],
-            "macro_mae": r["macro_mae"],
-            "rationale_f1": r["rationale_f1"],
-            "leakage_rate": r["leakage_rate"],
-            "val_loss": r["val_loss"]
-        }
+        selected_metrics = _build_selected_metrics(BENCHMARK_HISTORY[selected_abs_key])
     elif selected_display_id and selected_display_id in BENCHMARK_HISTORY:
-        r = BENCHMARK_HISTORY[selected_display_id]
-        selected_metrics = {
-            "acc_at_0": r["acc_at_0"],
-            "aspect_macro_f1": r["aspect_macro_f1"],
-            "macro_mae": r["macro_mae"],
-            "rationale_f1": r["rationale_f1"],
-            "leakage_rate": r["leakage_rate"],
-            "val_loss": r["val_loss"]
-        }
+        selected_metrics = _build_selected_metrics(BENCHMARK_HISTORY[selected_display_id])
     elif all_rows and not selected_display_id:
-        r = all_rows[-1]
-        selected_metrics = {
-            "acc_at_0": r["acc_at_0"],
-            "aspect_macro_f1": r["aspect_macro_f1"],
-            "macro_mae": r["macro_mae"],
-            "rationale_f1": r["rationale_f1"],
-            "leakage_rate": r["leakage_rate"],
-            "val_loss": r["val_loss"]
-        }
+        selected_metrics = _build_selected_metrics(all_rows[-1])
 
     return {
         "has_model": selected_info is not None,
@@ -2344,6 +2515,7 @@ def evaluate_new_review(review_text: str, model_key: str) -> Dict[str, Any]:
             ckpt = bundle["ckpt"]
             net = bundle["model"]
             tok = bundle["tokenizer"]
+            max_seq_len = int(bundle.get("max_seq_len") or 256)
             f_mean = bundle["feat_mean"]
             f_std = bundle["feat_std"]
 
@@ -2351,7 +2523,7 @@ def evaluate_new_review(review_text: str, model_key: str) -> Dict[str, Any]:
             lines = []
             aspect_segments: Dict[str, List[Dict[str, str]]] = {}
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 if arch == "paper4_bm25_tfigm_svm_cnn":
                     word2idx = ckpt.get("word2idx", {})
                     igm_weights = ckpt.get("igm_weights", np.zeros(net.embedding.num_embeddings, dtype=np.float32))
@@ -2423,7 +2595,7 @@ def evaluate_new_review(review_text: str, model_key: str) -> Dict[str, Any]:
                         else:
                             aspect_segments[asp] = []
                 else:
-                    enc = tok(raw_text, max_length=256, padding="max_length", truncation=True, return_tensors="pt")
+                    enc = tok(raw_text, max_length=max_seq_len, padding=False, truncation=True, return_tensors="pt")
                     input_ids = enc["input_ids"].to(DEVICE)
                     attention_mask = enc["attention_mask"].to(DEVICE)
 
@@ -2446,18 +2618,20 @@ def evaluate_new_review(review_text: str, model_key: str) -> Dict[str, Any]:
                             norm_feat = raw_feat
 
                         dense_tensor = torch.tensor(norm_feat, dtype=torch.float32, device=DEVICE).unsqueeze(0)
-                        outputs = net(input_ids=input_ids, attention_mask=attention_mask, dense_features=dense_tensor)
+                        with _get_eval_amp_context():
+                            outputs = net(input_ids=input_ids, attention_mask=attention_mask, dense_features=dense_tensor)
                     else:
-                        outputs = net(input_ids=input_ids, attention_mask=attention_mask)
+                        with _get_eval_amp_context():
+                            outputs = net(input_ids=input_ids, attention_mask=attention_mask)
 
-                    asp_probs = F.softmax(outputs["aspect_logits"].squeeze(0), dim=-1).cpu().numpy()
+                    asp_probs = F.softmax(outputs["aspect_logits"].squeeze(0).float(), dim=-1).cpu().numpy()
                     multi_pol_probs = None
                     if (
                         arch == "cram_absa"
                         and getattr(net, "has_trained_multi_pol", False)
                         and "aspect_multi_pol_logits" in outputs
                     ):
-                        multi_pol_probs = torch.sigmoid(outputs["aspect_multi_pol_logits"].squeeze(0)).cpu().numpy()
+                        multi_pol_probs = torch.sigmoid(outputs["aspect_multi_pol_logits"].squeeze(0).float()).cpu().numpy()
 
                     for a_idx, asp in enumerate(CANONICAL_ASPECTS):
                         pred_cls = int(np.argmax(asp_probs[a_idx]))
